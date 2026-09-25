@@ -1,0 +1,803 @@
+#!/bin/bash
+
+# Clash Verge lifecycle wrapper and safety guard for the local desktop session.
+#
+# The desktop launcher calls `launch`; systemd --user calls `guard`.  A normal
+# GUI exit records desired_state=stopped, stops only the service-owned Mihomo
+# child, waits for the listener/TUN to disappear, and restores the GNOME proxy
+# snapshot captured before launch.  A non-zero GUI exit is retried with bounded
+# exponential backoff by the launch wrapper.
+
+set -uo pipefail
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+readonly GUI_BIN="${CLASH_LIFECYCLE_GUI_BIN:-/usr/bin/clash-verge}"
+readonly GUI_NAME="${CLASH_LIFECYCLE_GUI_NAME:-clash-verge}"
+readonly CORE_NAME="${CLASH_LIFECYCLE_CORE_NAME:-verge-mihomo}"
+readonly SERVICE_NAME="${CLASH_LIFECYCLE_SERVICE_NAME:-clash-verge-service}"
+readonly SERVICE_SOCKET="${CLASH_LIFECYCLE_SERVICE_SOCKET:-/tmp/verge/clash-verge-service.sock}"
+readonly CORE_SOCKET="${CLASH_LIFECYCLE_CORE_SOCKET:-/tmp/verge/verge-mihomo.sock}"
+readonly CLASH_PROXY_HOST="'127.0.0.1'"
+readonly CLASH_PROXY_PORT="${CLASH_LIFECYCLE_PROXY_PORT:-7897}"
+readonly CLASH_PAC_URL="'http://127.0.0.1:33331/commands/pac'"
+readonly IPC_MAGIC="A thing of beauty is a joy for ever. Its loveliness increases; it will never pass into nothingness."
+readonly GSETTINGS_BIN="${CLASH_LIFECYCLE_GSETTINGS_BIN:-gsettings}"
+readonly PGREP_BIN="${CLASH_LIFECYCLE_PGREP_BIN:-pgrep}"
+readonly CURL_BIN="${CLASH_LIFECYCLE_CURL_BIN:-curl}"
+readonly SS_BIN="${CLASH_LIFECYCLE_SS_BIN:-ss}"
+readonly IP_BIN="${CLASH_LIFECYCLE_IP_BIN:-ip}"
+readonly STATE_ROOT="${CLASH_LIFECYCLE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/clash-verge-lifecycle}"
+readonly DESIRED_FILE="$STATE_ROOT/desired_state"
+readonly SNAPSHOT_FILE="$STATE_ROOT/gnome-proxy.snapshot"
+readonly ACTIVE_SNAPSHOT_FILE="$STATE_ROOT/gnome-proxy.active.snapshot"
+readonly SNAPSHOT_SOURCE_FILE="$STATE_ROOT/snapshot_source"
+readonly LEASE_FILE="$STATE_ROOT/launcher.lease"
+readonly LAUNCH_LOCK="$STATE_ROOT/launch.lock"
+readonly GUARD_LOCK="$STATE_ROOT/guard.lock"
+readonly CLEANUP_LOCK="$STATE_ROOT/cleanup.lock"
+readonly IPC_LOG_PREFIX="[clash-verge-lifecycle]"
+
+user_id="$(id -u)"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$user_id}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
+umask 077
+mkdir -p "$STATE_ROOT"
+chmod 700 "$STATE_ROOT"
+
+log() {
+  printf '%s %s\n' "$IPC_LOG_PREFIX" "$*"
+}
+
+atomic_write() {
+  local path="$1" value="$2" tmp
+  tmp="$path.tmp.$$"
+  printf '%s\n' "$value" >"$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$path"
+}
+
+set_desired_state() {
+  case "$1" in
+    running | stopped) atomic_write "$DESIRED_FILE" "$1" ;;
+    *) return 2 ;;
+  esac
+}
+
+desired_state() {
+  local value="stopped"
+  if [[ -r "$DESIRED_FILE" ]]; then
+    IFS= read -r value <"$DESIRED_FILE" || value="stopped"
+  fi
+  case "$value" in
+    running | stopped) printf '%s\n' "$value" ;;
+    *) printf '%s\n' stopped ;;
+  esac
+}
+
+any_gui_running() {
+  "$PGREP_BIN" -u "$user_id" -x "$GUI_NAME" >/dev/null 2>&1
+}
+
+lease_field() {
+  local key="$1" line
+  [[ -r "$LEASE_FILE" ]] || return 1
+  IFS= read -r line <"$LEASE_FILE" || return 1
+  printf '%s\n' "$line" |
+    tr ' ' '\n' |
+    sed -n "s/^${key}=//p" |
+    head -n 1
+}
+
+core_pids() {
+  "$PGREP_BIN" -x "$CORE_NAME" 2>/dev/null || true
+}
+
+pid_start_ticks() {
+  local pid="$1"
+  [[ -r "/proc/$pid/stat" ]] || return 1
+  awk '{print $22}' "/proc/$pid/stat" 2>/dev/null
+}
+
+pid_exe() {
+  readlink -f "/proc/$1/exe" 2>/dev/null
+}
+
+single_gui_pid_for_adoption() {
+  local expected_exe pid actual_exe match="" count=0
+  expected_exe="$(readlink -f "$GUI_BIN" 2>/dev/null)"
+  [[ -n "$expected_exe" ]] || return 1
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    actual_exe="$(pid_exe "$pid")"
+    [[ "$actual_exe" == "$expected_exe" ]] || continue
+    match="$pid"
+    count=$((count + 1))
+  done < <("$PGREP_BIN" -u "$user_id" -x "$GUI_NAME" 2>/dev/null || true)
+  (( count == 1 )) || return 1
+  printf '%s\n' "$match"
+}
+
+write_adopted_lease() {
+  local gui_pid="$1" gui_ticks gui_exe
+  gui_ticks="$(pid_start_ticks "$gui_pid" 2>/dev/null || true)"
+  gui_exe="$(pid_exe "$gui_pid")"
+  [[ -n "$gui_ticks" && -n "$gui_exe" ]] || return 1
+  atomic_write "$LEASE_FILE" "lease_kind=adopted launcher_pid=0 launcher_start_ticks=0 launcher_exe=none gui_pid=$gui_pid gui_start_ticks=$gui_ticks gui_exe=$gui_exe"
+}
+
+owned_gui_pid() {
+  local gui_pid expected_ticks expected_exe actual_ticks actual_exe
+  gui_pid="$(lease_field gui_pid)" || return 1
+  expected_ticks="$(lease_field gui_start_ticks)" || return 1
+  expected_exe="$(lease_field gui_exe)" || return 1
+  [[ "$gui_pid" =~ ^[1-9][0-9]*$ && -n "$expected_ticks" && -n "$expected_exe" ]] || return 1
+  actual_ticks="$(pid_start_ticks "$gui_pid" 2>/dev/null || true)"
+  actual_exe="$(pid_exe "$gui_pid")"
+  [[ "$actual_ticks" == "$expected_ticks" && "$actual_exe" == "$expected_exe" ]] || return 1
+  printf '%s\n' "$gui_pid"
+}
+
+owned_gui_running() {
+  owned_gui_pid >/dev/null 2>&1
+}
+
+service_owned_core_running() {
+  local pid ppid parent_exe parent_argv0
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ -r "/proc/$pid/status" ]] || continue
+    ppid="$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null)"
+    [[ "$ppid" =~ ^[0-9]+$ ]] || continue
+    parent_exe="$(pid_exe "$ppid")"
+    # hidepid/ptrace restrictions can make /proc/<root-pid>/exe unreadable to
+    # the desktop user even though cmdline is readable.  Accept argv[0] only
+    # as the fallback; never match a substring in the rest of the command.
+    parent_argv0="$(tr '\0' '\n' <"/proc/$ppid/cmdline" 2>/dev/null | head -n 1)"
+    if [[ "${parent_exe##*/}" == "$SERVICE_NAME" ||
+          "${parent_argv0##*/}" == "$SERVICE_NAME" ]]; then
+      return 0
+    fi
+  done < <(core_pids)
+  return 1
+}
+
+port_listening() {
+  "$SS_BIN" -H -ltn "sport = :$CLASH_PROXY_PORT" 2>/dev/null | grep -q .
+}
+
+tun_present() {
+  "$IP_BIN" link show Meta >/dev/null 2>&1
+}
+
+gsettings_get() {
+  "$GSETTINGS_BIN" get "$1" "$2" 2>/dev/null
+}
+
+clash_owns_system_proxy() {
+  local mode http_host https_host socks_host http_port https_port socks_port pac_url
+  mode="$(gsettings_get org.gnome.system.proxy mode)" || return 2
+  case "$mode" in
+    "'manual'")
+      http_host="$(gsettings_get org.gnome.system.proxy.http host)" || return 2
+      https_host="$(gsettings_get org.gnome.system.proxy.https host)" || return 2
+      socks_host="$(gsettings_get org.gnome.system.proxy.socks host)" || return 2
+      http_port="$(gsettings_get org.gnome.system.proxy.http port)" || return 2
+      https_port="$(gsettings_get org.gnome.system.proxy.https port)" || return 2
+      socks_port="$(gsettings_get org.gnome.system.proxy.socks port)" || return 2
+      [[ "$http_host" == "$CLASH_PROXY_HOST" &&
+         "$https_host" == "$CLASH_PROXY_HOST" &&
+         "$socks_host" == "$CLASH_PROXY_HOST" &&
+         "$http_port" == "$CLASH_PROXY_PORT" &&
+         "$https_port" == "$CLASH_PROXY_PORT" &&
+         "$socks_port" == "$CLASH_PROXY_PORT" ]]
+      ;;
+    "'auto'")
+      pac_url="$(gsettings_get org.gnome.system.proxy autoconfig-url)" || return 2
+      [[ "$pac_url" == "$CLASH_PAC_URL" ]]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+proxy_keys() {
+  printf '%s\n' \
+    'org.gnome.system.proxy|autoconfig-url' \
+    'org.gnome.system.proxy|ignore-hosts' \
+    'org.gnome.system.proxy|use-same-proxy' \
+    'org.gnome.system.proxy.ftp|host' \
+    'org.gnome.system.proxy.ftp|port' \
+    'org.gnome.system.proxy.http|authentication-password' \
+    'org.gnome.system.proxy.http|authentication-user' \
+    'org.gnome.system.proxy.http|enabled' \
+    'org.gnome.system.proxy.http|host' \
+    'org.gnome.system.proxy.http|port' \
+    'org.gnome.system.proxy.http|use-authentication' \
+    'org.gnome.system.proxy.https|host' \
+    'org.gnome.system.proxy.https|port' \
+    'org.gnome.system.proxy.socks|host' \
+    'org.gnome.system.proxy.socks|port' \
+    'org.gnome.system.proxy|mode'
+}
+
+capture_proxy_snapshot() {
+  local source="${1:-launcher}"
+  [[ ! -e "$SNAPSHOT_FILE" ]] || return 0
+
+  capture_proxy_state_file "$SNAPSHOT_FILE" || {
+    log "cannot read the complete GNOME proxy state; launch cancelled"
+    return 1
+  }
+  rm -f "$ACTIVE_SNAPSHOT_FILE"
+  atomic_write "$SNAPSHOT_SOURCE_FILE" "$source"
+  log "captured pre-Clash GNOME proxy state"
+}
+
+capture_proxy_state_file() {
+  local target="$1" tmp schema key value encoded
+  tmp="$target.tmp.${BASHPID:-$$}"
+  : >"$tmp"
+  while IFS='|' read -r schema key; do
+    value="$(gsettings_get "$schema" "$key")" || {
+      rm -f "$tmp"
+      return 1
+    }
+    encoded="$(printf '%s' "$value" | base64 -w0)"
+    printf '%s\t%s\t%s\n' "$schema" "$key" "$encoded" >>"$tmp"
+  done < <(proxy_keys)
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$target"
+}
+
+capture_active_proxy_snapshot_if_ready() {
+  [[ -r "$SNAPSHOT_FILE" ]] || return 1
+  [[ ! -e "$ACTIVE_SNAPSHOT_FILE" ]] || return 0
+
+  clash_owns_system_proxy || return $?
+  capture_proxy_state_file "$ACTIVE_SNAPSHOT_FILE" || return 2
+  log "captured active Clash GNOME proxy state"
+}
+
+capture_active_proxy_snapshot_when_ready() {
+  local check
+  for check in $(seq 1 15); do
+    [[ -e "$ACTIVE_SNAPSHOT_FILE" ]] && return 0
+    capture_active_proxy_snapshot_if_ready && return 0
+    sleep 1
+  done
+  return 1
+}
+
+snapshot_encoded_value() {
+  local file="$1" schema="$2" key="$3"
+  awk -F '\t' -v wanted_schema="$schema" -v wanted_key="$key" '
+    $1 == wanted_schema && $2 == wanted_key { count += 1; value = $3 }
+    END {
+      if (count == 1) {
+        print value
+        exit 0
+      }
+      exit 1
+    }
+  ' "$file" 2>/dev/null
+}
+
+snapshot_is_complete() {
+  local file="$1" schema key
+  [[ -r "$file" ]] || return 1
+  while IFS='|' read -r schema key; do
+    snapshot_encoded_value "$file" "$schema" "$key" >/dev/null || return 1
+  done < <(proxy_keys)
+}
+
+# A restore is safe only when every current key still equals either the
+# pre-launch value or the value captured after Clash became active.  This is a
+# whole-state compare-and-swap guard: one unrelated user edit preserves the
+# complete newer state instead of producing a mixture of old and new keys.
+current_matches_pre_or_active() {
+  local current="$1" active="${2:-}" schema key current_value pre_value active_value
+  snapshot_is_complete "$SNAPSHOT_FILE" || return 2
+  snapshot_is_complete "$current" || return 2
+  if [[ -n "$active" ]]; then
+    snapshot_is_complete "$active" || return 2
+  fi
+
+  while IFS='|' read -r schema key; do
+    current_value="$(snapshot_encoded_value "$current" "$schema" "$key")" || return 2
+    pre_value="$(snapshot_encoded_value "$SNAPSHOT_FILE" "$schema" "$key")" || return 2
+    [[ "$current_value" == "$pre_value" ]] && continue
+    if [[ -n "$active" ]]; then
+      active_value="$(snapshot_encoded_value "$active" "$schema" "$key")" || return 2
+      [[ "$current_value" == "$active_value" ]] && continue
+    fi
+    return 1
+  done < <(proxy_keys)
+  return 0
+}
+
+clear_proxy_recovery_state() {
+  rm -f "$SNAPSHOT_FILE" "$ACTIVE_SNAPSHOT_FILE" "$SNAPSHOT_SOURCE_FILE"
+}
+
+# Adopt the already-running instance installed before this wrapper.  The prior
+# guard journal proves its clean baseline was mode=none; retain all inactive
+# field values but replace only the saved mode.  This command refuses to run
+# unless the current listener and proxy are unmistakably Clash-owned.
+adopt_current_with_none_baseline() {
+  local current tmp encoded_none gui_pid
+  any_gui_running && service_owned_core_running && port_listening && clash_owns_system_proxy || {
+    log "cannot adopt current session: ownership checks failed"
+    return 1
+  }
+  gui_pid="$(single_gui_pid_for_adoption)" || {
+    log "cannot adopt current session: expected exactly one matching GUI executable"
+    return 1
+  }
+
+  current="$STATE_ROOT/adopt-current.${BASHPID:-$$}.snapshot"
+  capture_proxy_state_file "$current" || {
+    log "cannot adopt current session: failed to capture the active proxy state"
+    return 1
+  }
+  tmp="$SNAPSHOT_FILE.tmp.${BASHPID:-$$}"
+  encoded_none="$(printf '%s' "'none'" | base64 -w0)"
+  awk -F '\t' -v replacement="$encoded_none" 'BEGIN {OFS="\t"} $1=="org.gnome.system.proxy" && $2=="mode" {$3=replacement} {print}' "$current" >"$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$SNAPSHOT_FILE"
+  mv -f "$current" "$ACTIVE_SNAPSHOT_FILE"
+  atomic_write "$SNAPSHOT_SOURCE_FILE" "adopted-current; baseline inferred from prior clean guard event"
+  write_adopted_lease "$gui_pid" || {
+    clear_proxy_recovery_state
+    log "cannot adopt current session: failed to record the GUI lease"
+    return 1
+  }
+  set_desired_state running
+  log "adopted current GUI with recorded pre-Clash mode=none baseline"
+}
+
+restore_proxy_snapshot() {
+  local schema key encoded value mode_schema="" mode_key="" mode_value="" failures=0
+  local ownership_status compare_status current active_for_compare=""
+  [[ -r "$SNAPSHOT_FILE" ]] || {
+    # Cleanup can run concurrently from the launcher, an explicit stop, and
+    # the guard. Once the first owner has consumed/cleared the snapshot, every
+    # later pass must be a strict no-op; otherwise it could overwrite a newer
+    # user proxy choice after the compare-and-swap decision already completed.
+    rm -f "$ACTIVE_SNAPSHOT_FILE" "$SNAPSHOT_SOURCE_FILE"
+    log "no pre-Clash recovery snapshot remains; leaving GNOME proxy state untouched"
+    return 0
+  }
+
+  current="$STATE_ROOT/gnome-proxy.current.${BASHPID:-$$}.snapshot"
+  capture_proxy_state_file "$current" || {
+    log "cannot read the current GNOME proxy state; retaining the recovery snapshots"
+    return 1
+  }
+
+  if [[ -r "$ACTIVE_SNAPSHOT_FILE" ]]; then
+    active_for_compare="$ACTIVE_SNAPSHOT_FILE"
+  else
+    # A crash can occur before the complete active state was captured. In that
+    # case the recognized host/port tuple is not enough to overwrite unrelated
+    # proxy keys: first allow an exact pre-launch match, otherwise preserve the
+    # current state and retain the recovery snapshot for a later/manual retry.
+    current_matches_pre_or_active "$current" ""
+    compare_status=$?
+    if (( compare_status == 0 )); then
+      active_for_compare=""
+    elif (( compare_status == 1 )); then
+      clash_owns_system_proxy
+      ownership_status=$?
+      rm -f "$current"
+      case "$ownership_status" in
+        0)
+          log "active Clash proxy baseline was not captured; refusing an unsafe partial restore"
+          return 1
+          ;;
+        1)
+          log "GNOME proxy state changed before an active baseline was captured; preserving it"
+          clear_proxy_recovery_state
+          return 0
+          ;;
+        *)
+          log "cannot confirm current proxy ownership; retaining the recovery snapshots"
+          return 1
+          ;;
+      esac
+    else
+      rm -f "$current"
+      log "proxy recovery snapshot is incomplete or corrupt; retaining it for diagnosis"
+      return 1
+    fi
+  fi
+
+  current_matches_pre_or_active "$current" "$active_for_compare"
+  compare_status=$?
+  rm -f "$current"
+  case "$compare_status" in
+    0) ;;
+    1)
+      log "GNOME proxy keys changed after Clash launch; preserving the complete newer user state"
+      clear_proxy_recovery_state
+      return 0
+      ;;
+    *)
+      log "proxy recovery snapshot is incomplete or corrupt; retaining it for diagnosis"
+      return 1
+      ;;
+  esac
+
+  while IFS='|' read -r schema key; do
+    encoded="$(snapshot_encoded_value "$SNAPSHOT_FILE" "$schema" "$key")" || {
+      failures=$((failures + 1))
+      continue
+    }
+    value="$(printf '%s' "$encoded" | base64 -d 2>/dev/null)" || {
+      failures=$((failures + 1))
+      continue
+    }
+    if [[ "$schema" == "org.gnome.system.proxy" && "$key" == "mode" ]]; then
+      mode_schema="$schema"
+      mode_key="$key"
+      mode_value="$value"
+      continue
+    fi
+    "$GSETTINGS_BIN" set "$schema" "$key" "$value" >/dev/null 2>&1 || failures=$((failures + 1))
+  done < <(proxy_keys)
+
+  if [[ -n "$mode_schema" ]]; then
+    "$GSETTINGS_BIN" set "$mode_schema" "$mode_key" "$mode_value" >/dev/null 2>&1 || failures=$((failures + 1))
+  else
+    failures=$((failures + 1))
+  fi
+
+  if (( failures == 0 )); then
+    clear_proxy_recovery_state
+    log "restored the exact pre-Clash GNOME proxy state"
+    return 0
+  fi
+  log "GNOME proxy restore had $failures failure(s); snapshot retained at $SNAPSHOT_FILE"
+  return 1
+}
+
+stop_service_owned_core() {
+  local response
+  service_owned_core_running || return 0
+  [[ -S "$SERVICE_SOCKET" ]] || {
+    log "service-owned core found but service socket is missing"
+    return 1
+  }
+  response="$("$CURL_BIN" --silent --show-error --max-time 5 \
+    --unix-socket "$SERVICE_SOCKET" \
+    -X DELETE \
+    -H 'host: localhost' \
+    -H 'user-agent: cc-switch-acceptance/1' \
+    -H "x-ipc-magic: $IPC_MAGIC" \
+    http://localhost/clash/stop 2>/dev/null || true)"
+  [[ "$response" == *'"code":0'* ]]
+}
+
+verify_stopped_three_times() {
+  local check
+  for check in 1 2 3; do
+    if service_owned_core_running || port_listening || [[ -S "$CORE_SOCKET" ]] || tun_present; then
+      return 1
+    fi
+    (( check == 3 )) || sleep 2
+  done
+  return 0
+}
+
+cleanup_stopped_state() {
+  local cleanup_fd status
+  exec {cleanup_fd}>"$CLEANUP_LOCK"
+  flock "$cleanup_fd" || {
+    exec {cleanup_fd}>&-
+    return 1
+  }
+  cleanup_stopped_state_locked
+  status=$?
+  exec {cleanup_fd}>&-
+  return "$status"
+}
+
+cleanup_stopped_state_locked() {
+  if any_gui_running && ! owned_gui_running; then
+    log "an unowned Clash GUI is running; refusing to stop its core or restore proxy state"
+    return 1
+  fi
+
+  if service_owned_core_running; then
+    if stop_service_owned_core; then
+      log "requested stop for the service-owned Mihomo core"
+    else
+      log "failed to stop the service-owned Mihomo core; will retry"
+      return 1
+    fi
+  fi
+
+  if ! verify_stopped_three_times; then
+    log "cleanup not complete: core, $CLASH_PROXY_PORT, socket, or TUN still present"
+    return 1
+  fi
+  restore_proxy_snapshot
+}
+
+request_stop() {
+  local check gui_pid=""
+
+  if gui_pid="$(owned_gui_pid)"; then
+    set_desired_state stopped
+    kill -TERM "$gui_pid" >/dev/null 2>&1 || true
+    for check in 1 2 3 4 5; do
+      owned_gui_running || break
+      sleep 2
+    done
+    if owned_gui_running; then
+      log "owned GUI did not exit after the stop request; refusing to tear down its live core"
+      return 1
+    fi
+    rm -f "$LEASE_FILE"
+  elif lease_launcher_alive; then
+    # The wrapper can legitimately be in exponential backoff with no GUI.
+    # Mark it stopped and let that live wrapper perform the cleanup.  Wait
+    # longer than the maximum 30-second restart delay so a successful stop
+    # never returns while the launcher still owns the launch lock.
+    set_desired_state stopped
+    for check in $(seq 1 20); do
+      # The launcher may have crossed from provisional ownership into a GUI
+      # spawn just after this stop request was classified. Terminate only that
+      # newly lease-validated child; never fall back to a name-wide signal.
+      gui_pid="$(owned_gui_pid 2>/dev/null || true)"
+      [[ -z "$gui_pid" ]] || kill -TERM "$gui_pid" >/dev/null 2>&1 || true
+      lease_launcher_alive || break
+      sleep 2
+    done
+    if lease_launcher_alive; then
+      log "lifecycle launcher did not stop after the stop request; refusing to report a completed stop"
+      return 1
+    fi
+  elif any_gui_running || service_owned_core_running; then
+    log "no valid lifecycle lease owns the running Clash instance; refusing to stop it"
+    return 1
+  else
+    set_desired_state stopped
+    rm -f "$LEASE_FILE"
+  fi
+
+  cleanup_stopped_state
+}
+
+write_lease() {
+  local launcher_pid="$1" gui_pid="$2" launcher_ticks launcher_exe gui_ticks gui_exe
+  launcher_ticks="$(pid_start_ticks "$launcher_pid" 2>/dev/null || true)"
+  launcher_exe="$(pid_exe "$launcher_pid")"
+  gui_ticks="$(pid_start_ticks "$gui_pid" 2>/dev/null || true)"
+  gui_exe="$(pid_exe "$gui_pid")"
+  [[ -n "$launcher_ticks" && -n "$launcher_exe" && -n "$gui_ticks" && -n "$gui_exe" ]] || return 1
+  atomic_write "$LEASE_FILE" "lease_kind=launcher launcher_pid=$launcher_pid launcher_start_ticks=$launcher_ticks launcher_exe=$launcher_exe gui_pid=$gui_pid gui_start_ticks=$gui_ticks gui_exe=$gui_exe"
+}
+
+write_provisional_launcher_lease() {
+  local launcher_pid="$1" launcher_ticks launcher_exe
+  launcher_ticks="$(pid_start_ticks "$launcher_pid" 2>/dev/null || true)"
+  launcher_exe="$(pid_exe "$launcher_pid")"
+  [[ -n "$launcher_ticks" && -n "$launcher_exe" ]] || return 1
+  atomic_write "$LEASE_FILE" "lease_kind=launcher launcher_pid=$launcher_pid launcher_start_ticks=$launcher_ticks launcher_exe=$launcher_exe gui_pid=0 gui_start_ticks=0 gui_exe=none"
+}
+
+lease_launcher_alive() {
+  local launcher_pid expected_ticks expected_exe actual_ticks actual_exe
+  [[ "$(lease_field lease_kind 2>/dev/null || true)" == launcher ]] || return 1
+  launcher_pid="$(lease_field launcher_pid)" || return 1
+  expected_ticks="$(lease_field launcher_start_ticks)" || return 1
+  expected_exe="$(lease_field launcher_exe)" || return 1
+  [[ "$launcher_pid" =~ ^[1-9][0-9]*$ && -n "$expected_ticks" && -n "$expected_exe" ]] || return 1
+  actual_ticks="$(pid_start_ticks "$launcher_pid" 2>/dev/null || true)"
+  actual_exe="$(pid_exe "$launcher_pid")"
+  [[ "$actual_ticks" == "$expected_ticks" && "$actual_exe" == "$expected_exe" ]]
+}
+
+launch_gui() {
+  exec 8>"$LAUNCH_LOCK"
+  if ! flock -n 8; then
+    # Only a live, leased GUI may receive single-instance activation.  The
+    # launcher can also hold this lock during crash backoff or shutdown; a raw
+    # exec in either state would create an unleased GUI outside the lifecycle.
+    if owned_gui_running && [[ "$(desired_state)" == running ]]; then
+      exec "$GUI_BIN" "$@"
+    fi
+    log "lifecycle launcher is busy without an active owned GUI; refusing an unleased launch"
+    return 1
+  fi
+
+  if any_gui_running; then
+    log "a Clash GUI without this launcher's lease is already running; forwarding activation without adopting ownership"
+    exec "$GUI_BIN" "$@"
+  fi
+  if service_owned_core_running; then
+    log "a service-owned core exists without a GUI lease; refusing to claim or stop it"
+    return 1
+  fi
+  # Publish launcher ownership before any potentially slow DBus snapshot work.
+  # A concurrent `stop` can then set desired_state=stopped and wait for this
+  # launcher; the launcher checks that state before it is allowed to spawn GUI.
+  set_desired_state running || return 1
+  if ! write_provisional_launcher_lease "$$"; then
+    set_desired_state stopped
+    return 1
+  fi
+  if [[ -e "$SNAPSHOT_FILE" || -e "$ACTIVE_SNAPSHOT_FILE" || -e "$SNAPSHOT_SOURCE_FILE" ]]; then
+    # A prior shutdown may have retained recovery data after a transient DBus,
+    # listener, or TUN failure.  Never reuse that baseline for a new session:
+    # first converge the old stopped state under the cleanup lock, then capture
+    # a fresh pre-launch snapshot.  An unsafe/unreadable recovery blocks launch.
+    log "pending proxy recovery state found; resolving it before a new launch"
+    if ! cleanup_stopped_state; then
+      rm -f "$LEASE_FILE"
+      set_desired_state stopped
+      log "pending proxy recovery could not be resolved; launch refused"
+      return 1
+    fi
+  fi
+  if [[ "$(desired_state)" == stopped ]]; then
+    rm -f "$LEASE_FILE"
+    cleanup_stopped_state || true
+    return 0
+  fi
+  if ! capture_proxy_snapshot launcher; then
+    rm -f "$LEASE_FILE"
+    set_desired_state stopped
+    return 1
+  fi
+  if [[ "$(desired_state)" == stopped ]]; then
+    rm -f "$LEASE_FILE"
+    cleanup_stopped_state || true
+    return 0
+  fi
+
+  local attempt=0 delay=2 child_pid status started now runtime stop_requested=0 snapshot_watcher_pid=""
+  trap 'stop_requested=1; [[ -n "${child_pid:-}" ]] && kill -TERM "$child_pid" 2>/dev/null || true; [[ -n "${snapshot_watcher_pid:-}" ]] && kill "$snapshot_watcher_pid" 2>/dev/null || true' INT TERM HUP
+
+  while :; do
+    if (( stop_requested == 1 )) || [[ "$(desired_state)" == stopped ]]; then
+      rm -f "$LEASE_FILE"
+      set_desired_state stopped
+      cleanup_stopped_state || true
+      return 0
+    fi
+
+    started="$(date +%s)"
+    "$GUI_BIN" "$@" &
+    child_pid=$!
+    if ! write_lease "$$" "$child_pid"; then
+      kill -TERM "$child_pid" >/dev/null 2>&1 || true
+      wait "$child_pid" 2>/dev/null || true
+      rm -f "$LEASE_FILE"
+      set_desired_state stopped
+      cleanup_stopped_state || true
+      return 1
+    fi
+    if [[ "$(desired_state)" == stopped ]]; then
+      kill -TERM "$child_pid" >/dev/null 2>&1 || true
+      wait "$child_pid" 2>/dev/null || true
+      rm -f "$LEASE_FILE"
+      cleanup_stopped_state || true
+      return 0
+    fi
+    capture_active_proxy_snapshot_when_ready &
+    snapshot_watcher_pid=$!
+    wait "$child_pid"
+    status=$?
+    kill "$snapshot_watcher_pid" >/dev/null 2>&1 || true
+    wait "$snapshot_watcher_pid" 2>/dev/null || true
+    snapshot_watcher_pid=""
+    now="$(date +%s)"
+    runtime=$((now - started))
+
+    if (( stop_requested == 1 || status == 0 )) || [[ "$(desired_state)" == stopped ]]; then
+      rm -f "$LEASE_FILE"
+      set_desired_state stopped
+      cleanup_stopped_state || true
+      return 0
+    fi
+
+    if (( runtime >= 300 )); then
+      attempt=0
+      delay=2
+    fi
+    attempt=$((attempt + 1))
+    if (( attempt >= 5 )); then
+      rm -f "$LEASE_FILE"
+      set_desired_state stopped
+      log "GUI crashed $attempt times; restart limit reached, leaving it stopped"
+      cleanup_stopped_state || true
+      return "$status"
+    fi
+    log "GUI exited abnormally (status=$status); recovering in ${delay}s (attempt $attempt/5)"
+    sleep "$delay"
+    delay=$((delay * 2))
+    (( delay <= 30 )) || delay=30
+  done
+}
+
+guard_loop() {
+  exec 7>"$GUARD_LOCK"
+  flock -n 7 || return 0
+  local missing_checks=0
+
+  while :; do
+    if owned_gui_running; then
+      capture_active_proxy_snapshot_if_ready >/dev/null 2>&1 || true
+      missing_checks=0
+      sleep 2
+      continue
+    fi
+
+    missing_checks=$((missing_checks + 1))
+    if (( missing_checks < 3 )); then
+      sleep 2
+      continue
+    fi
+
+    if [[ "$(desired_state)" == stopped ]]; then
+      cleanup_stopped_state || true
+    elif ! lease_launcher_alive; then
+      # A stale running marker without a live wrapper cannot safely be treated
+      # as a recoverable crash. Converge to stopped and clean it once.
+      set_desired_state stopped
+      rm -f "$LEASE_FILE"
+      log "removed a stale running lease after three failed GUI checks"
+      cleanup_stopped_state || true
+    fi
+    sleep 2
+  done
+}
+
+show_status() {
+  local gui=no any_gui=no core=no listener=no tun=no snapshot=no active_snapshot=no lease=no source=""
+  owned_gui_running && gui=yes
+  any_gui_running && any_gui=yes
+  service_owned_core_running && core=yes
+  port_listening && listener=yes
+  tun_present && tun=yes
+  [[ -r "$SNAPSHOT_FILE" ]] && snapshot=yes
+  [[ -r "$ACTIVE_SNAPSHOT_FILE" ]] && active_snapshot=yes
+  (lease_launcher_alive || owned_gui_running) && lease=yes
+  [[ -r "$SNAPSHOT_SOURCE_FILE" ]] && IFS= read -r source <"$SNAPSHOT_SOURCE_FILE"
+  printf 'desired_state=%s\n' "$(desired_state)"
+  printf 'gui_running=%s\nany_matching_gui=%s\nservice_owned_core=%s\nport_%s=%s\ntun_meta=%s\n' "$gui" "$any_gui" "$core" "$CLASH_PROXY_PORT" "$listener" "$tun"
+  printf 'snapshot=%s\nactive_snapshot=%s\nlifecycle_lease=%s\n' "$snapshot" "$active_snapshot" "$lease"
+  [[ -z "$source" ]] || printf 'snapshot_source=%s\n' "$source"
+}
+
+case "${1:-guard}" in
+  launch)
+    shift
+    launch_gui "$@"
+    ;;
+  guard)
+    guard_loop
+    ;;
+  stop)
+    request_stop
+    ;;
+  status)
+    show_status
+    ;;
+  snapshot)
+    capture_proxy_snapshot manual
+    ;;
+  restore)
+    restore_proxy_snapshot
+    ;;
+  adopt-current-none)
+    adopt_current_with_none_baseline
+    ;;
+  *)
+    printf 'Usage: %s {launch [args...]|guard|stop|status|snapshot|restore|adopt-current-none}\n' "$0" >&2
+    exit 2
+    ;;
+esac

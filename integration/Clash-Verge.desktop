@@ -1,0 +1,10 @@
+[Desktop Entry]
+Categories=Network;
+Comment=Clash Verge Rev with safe lifecycle cleanup
+Exec=sh -lc 'exec "$HOME/.local/bin/clash-verge-lifecycle-guard" launch "$1"' sh %u
+StartupWMClass=clash-verge
+Icon=clash-verge
+Name=Clash Verge
+Terminal=false
+Type=Application
+MimeType=x-scheme-handler/clash-verge;x-scheme-handler/clash;
