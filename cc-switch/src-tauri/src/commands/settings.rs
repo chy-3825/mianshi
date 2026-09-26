@@ -520,6 +520,7 @@ mod tests {
                 codex_official_history_unify_v1: Some(CodexOfficialHistoryUnifyMigration {
                     completed_at: "2026-06-12T00:00:00Z".to_string(),
                     target_provider_id: "custom".to_string(),
+                    migration_version: 0,
                     migrated_jsonl_files: 5,
                     migrated_state_rows: 7,
                     codex_config_dir: None,
@@ -573,6 +574,7 @@ mod tests {
                 codex_official_history_unify_v1: Some(CodexOfficialHistoryUnifyMigration {
                     completed_at: "2026-06-12T00:00:00Z".to_string(),
                     target_provider_id: "custom".to_string(),
+                    migration_version: 0,
                     migrated_jsonl_files: 1,
                     migrated_state_rows: 2,
                     codex_config_dir: None,
@@ -606,6 +608,7 @@ mod tests {
                 codex_official_history_unify_v1: Some(CodexOfficialHistoryUnifyMigration {
                     completed_at: "2026-06-12T00:00:00Z".to_string(),
                     target_provider_id: "custom".to_string(),
+                    migration_version: 0,
                     migrated_jsonl_files: 1,
                     migrated_state_rows: 2,
                     codex_config_dir: None,

@@ -766,6 +766,9 @@ pub fn run() {
             }
 
             {
+                // Existing JSONL files are only rewritten in an explicitly
+                // requested offline maintenance run. Normal CCS startup keeps
+                // all Codex session files untouched.
                 let db_for_codex_history_migration = app_state.db.clone();
                 tauri::async_runtime::spawn_blocking(move || {
                     match crate::codex_history_migration::maybe_migrate_codex_third_party_history_provider_bucket(
@@ -806,8 +809,8 @@ pub fn run() {
                         }
                     }
 
-                    // 统一会话开关的官方历史迁移：开关开启但上次未完成（如文件被占用
-                    // 中途失败）时在启动期重试；函数内部自门控，开关关闭时直接跳过。
+                    // Only an explicit offline maintenance run may rewrite
+                    // existing official session files.
                     match crate::codex_history_migration::maybe_migrate_codex_official_history_to_unified_bucket() {
                         Ok(outcome) => {
                             if let Some(reason) = outcome.skipped_reason {
@@ -1018,23 +1021,30 @@ pub fn run() {
             {
                 #[cfg(target_os = "linux")]
                 {
-                    // Use Tauri's path API to get correct path (includes app identifier)
-                    // tauri-plugin-deep-link writes to: ~/.local/share/com.ccswitch.desktop/applications/cc-switch-handler.desktop
-                    // Only register if .desktop file doesn't exist to avoid overwriting user customizations
-                    let should_register = app
-                        .path()
-                        .data_dir()
-                        .map(|d| !d.join("applications/cc-switch-handler.desktop").exists())
-                        .unwrap_or(true);
-
-                    if should_register {
-                        if let Err(e) = app.deep_link().register_all() {
-                            log::error!("✗ Failed to register deep link schemes: {}", e);
-                        } else {
-                            log::info!("✓ Deep link schemes registered (Linux)");
-                        }
+                    // Installed launchers own the ccswitch:// handler. Tauri's
+                    // registration would replace its Exec line with the raw
+                    // binary, losing the standalone environment cleanup.
+                    if std::env::var_os("CC_SWITCH_STANDALONE_LAUNCHER").is_some() {
+                        log::info!("⊘ Deep link handler is managed by the launcher");
                     } else {
-                        log::info!("⊘ Deep link handler already exists, skipping registration");
+                        // Use Tauri's path API to get correct path (includes app identifier)
+                        // tauri-plugin-deep-link writes to: ~/.local/share/com.ccswitch.desktop/applications/cc-switch-handler.desktop
+                        // Only register if .desktop file doesn't exist to avoid overwriting user customizations
+                        let should_register = app
+                            .path()
+                            .data_dir()
+                            .map(|d| !d.join("applications/cc-switch-handler.desktop").exists())
+                            .unwrap_or(true);
+
+                        if should_register {
+                            if let Err(e) = app.deep_link().register_all() {
+                                log::error!("✗ Failed to register deep link schemes: {}", e);
+                            } else {
+                                log::info!("✓ Deep link schemes registered (Linux)");
+                            }
+                        } else {
+                            log::info!("⊘ Deep link handler already exists, skipping registration");
+                        }
                     }
                 }
 

@@ -380,6 +380,15 @@ export const useSwitchProviderMutation = (appId: AppId) => {
       if (appId === "pi") {
         await invalidatePiProviderCaches(queryClient);
       }
+      if (appId === "codex") {
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ["providers", appId] }),
+          queryClient.invalidateQueries({ queryKey: proxyKeys.status }),
+          queryClient.invalidateQueries({ queryKey: proxyKeys.takeoverStatus }),
+          queryClient.invalidateQueries({ queryKey: proxyKeys.appConfig(appId) }),
+          queryClient.invalidateQueries({ queryKey: proxyKeys.globalConfig }),
+        ]);
+      }
     },
   });
 };

@@ -313,15 +313,13 @@
       "confirm": "I understand, enable"
     },
     "unifyCodexHistory": {
-      "title": "Unified Codex session history",
-      "message": "When enabled, the official subscription and third-party providers share one session history list. Note: resuming an old session across providers may fail because its encrypted_content reasoning cannot be decrypted by another backend.\n\nYou can also migrate your existing official session history into the shared list (originals are backed up to ~/.cc-switch/backups first and can be restored when you turn this off).",
-      "migrateExisting": "Also migrate existing official session history",
+      "title": "Use the shared group for official Codex sessions",
+      "message": "When enabled, future official-login sessions use the shared custom provider group. Non-official cards already use this group. Existing sessions are not rewritten. Continuing a session with another model may still fail if its backend cannot decrypt earlier reasoning content.",
       "confirm": "I understand, enable"
     },
     "unifyCodexHistoryOff": {
-      "title": "Turn off unified session history",
-      "message": "After turning this off, the official subscription and third-party providers return to separate history lists. Sessions created while it was on cannot be attributed to a provider, so they stay in the third-party history and the official subscription will not see them.",
-      "restoreBackup": "Restore the official sessions migrated at enable time back to the official history (exact restore from backup)",
+      "title": "Stop sharing the official session group",
+      "message": "When disabled, CCS stops assigning the shared custom provider group to future official-login sessions. Non-official cards continue using custom. Existing sessions are not rewritten or restored.",
       "confirm": "Turn off"
     },
     "usage": {
@@ -708,12 +706,8 @@
     "codexAuth": "Codex App Enhancements",
     "preserveCodexOfficialAuthOnSwitch": "Keep official login for direct switches",
     "preserveCodexOfficialAuthOnSwitchDescription": "Controls third-party switches when local routing is off. Takeover routing always preserves the Codex official login.",
-    "unifyCodexSessionHistory": "Unified Codex session history",
-    "unifyCodexSessionHistoryDescription": "When enabled, the official subscription runs under the shared \"custom\" provider id so official and third-party sessions appear in one history list, optionally migrating existing official sessions in (backed up first). When turning it off, the migrated sessions can be restored from backup. Note: resuming an old session across providers may fail because its encrypted_content reasoning can only be decrypted by the backend that created it.",
-    "unifyCodexHistoryRestoreCompleted": "Official session history restored from backup ({{files}} session files, {{rows}} index rows)",
-    "unifyCodexHistoryRestoreFailed": "Failed to restore official session history, please try again",
-    "unifyCodexHistoryRestoreNothing": "No restorable migration backup for the current Codex directory",
-    "unifyCodexHistoryRestoreSkippedToggleOn": "Unified session history was re-enabled; restore skipped",
+    "unifyCodexSessionHistory": "Use shared group for official sessions",
+    "unifyCodexSessionHistoryDescription": "Controls whether future official-login sessions use the shared custom provider group. Non-official cards already share custom. This switch does not rewrite existing records or guarantee cross-model session compatibility.",
     "appVisibility": {
       "title": "Homepage Display",
       "description": "Choose which apps to show on the homepage",

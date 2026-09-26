@@ -1,10 +1,11 @@
 //! Codex 第三方历史会话归桶迁移。
 //!
-//! 只迁移本机 `~/.codex` 历史数据；完成标记写入设备级 `settings.json`，
-//! 失败时不写标记，下一次启动自动重试。
+//! 只迁移本机 `~/.codex` 历史数据；完成标记写入设备级 `settings.json`。
+//! 旧 JSONL 的替换必须在明确的离线维护窗口执行，普通 CCS 启动只读历史。
 
 use crate::codex_config::{
-    get_codex_config_dir, read_codex_config_text, CC_SWITCH_CODEX_MODEL_PROVIDER_ID,
+    get_codex_config_dir, read_codex_config_text, write_codex_live_config_atomic,
+    CC_SWITCH_CODEX_MODEL_PROVIDER_ID, CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID,
 };
 use crate::codex_state_db::codex_state_db_paths;
 use crate::config::{atomic_write, copy_file, get_app_config_dir};
@@ -32,6 +33,34 @@ const OFFICIAL_UNIFY_RESTORE_BACKUP_NAME: &str = "codex-official-history-unify-r
 /// SQLite 变量上限保守值，IN 列表按此分块。
 const STATE_DB_ID_CHUNK: usize = 500;
 
+/// Replacing an open JSONL inode can strand later Codex appends in the old
+/// inode. Never rewrite existing sessions as a side effect of starting CCS or
+/// saving settings. An explicit maintenance run must close Codex first.
+fn offline_history_rewrite_allowed() -> bool {
+    if std::env::var("CC_SWITCH_CODEX_HISTORY_MIGRATION_OFFLINE").as_deref() != Ok("1") {
+        return false;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_name().to_string_lossy().bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            if fs::read_to_string(entry.path().join("comm"))
+                .is_ok_and(|name| name.trim() == "codex")
+            {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 /// 串行化官方历史的迁移与还原：开启迁移（启动重试 + 设置保存后台任务）和
 /// 关闭还原可能在毫秒级先后被触发，对同一批 jsonl / state DB 双向改写。
 static CODEX_OFFICIAL_HISTORY_OP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -45,10 +74,15 @@ fn lock_codex_official_history_op() -> std::sync::MutexGuard<'static, ()> {
 /// 官方订阅（ChatGPT OAuth / OpenAI API key）的历史会话都记录这个 id。
 const OFFICIAL_OPENAI_CODEX_MODEL_PROVIDER_ID: &str = "openai";
 const LEGACY_CC_SWITCH_CODEX_MODEL_PROVIDER_ID: &str = "ccswitch";
+/// Older Codex normalization used `cc-switch` as the internal provider id.
+/// It is still present in live configs and state DBs created by those builds;
+/// leaving it out makes official-login history appear to disappear again.
+const LEGACY_CC_SWITCH_CODEX_MIGRATED_PROVIDER_ID: &str = "cc-switch";
 // If a Codex preset ever used a temporary routing key, keep that old key here
 // so local history can be bucketed under the current custom provider id.
 const CC_SWITCH_LEGACY_CODEX_MODEL_PROVIDER_IDS: &[&str] = &[
     LEGACY_CC_SWITCH_CODEX_MODEL_PROVIDER_ID,
+    LEGACY_CC_SWITCH_CODEX_MIGRATED_PROVIDER_ID,
     "aicodemirror",
     "aicoding",
     "aigocode",
@@ -115,6 +149,12 @@ pub struct CodexProviderTemplateBucketMigrationOutcome {
 pub fn maybe_migrate_codex_third_party_history_provider_bucket(
     db: &Database,
 ) -> Result<CodexHistoryProviderBucketMigrationOutcome, AppError> {
+    if !offline_history_rewrite_allowed() {
+        return Ok(CodexHistoryProviderBucketMigrationOutcome {
+            skipped_reason: Some("offline_history_rewrite_required".to_string()),
+            ..Default::default()
+        });
+    }
     if crate::settings::is_codex_third_party_history_provider_bucket_migrated() {
         return Ok(CodexHistoryProviderBucketMigrationOutcome {
             skipped_reason: Some("already_migrated".to_string()),
@@ -124,16 +164,8 @@ pub fn maybe_migrate_codex_third_party_history_provider_bucket(
 
     let source_provider_ids = collect_source_model_provider_ids(db)?;
     if source_provider_ids.is_empty() {
-        crate::settings::mark_codex_third_party_history_provider_bucket_migrated(
-            CodexThirdPartyHistoryProviderBucketMigration {
-                completed_at: Utc::now().to_rfc3339(),
-                target_provider_id: CC_SWITCH_CODEX_MODEL_PROVIDER_ID.to_string(),
-                source_provider_ids: Vec::new(),
-                migrated_jsonl_files: 0,
-                migrated_state_rows: 0,
-                scanned_history_files: true,
-            },
-        )?;
+        // Do not make an empty scan permanent: a legacy provider may be added
+        // later, or the configured Codex directory may change.
         return Ok(CodexHistoryProviderBucketMigrationOutcome {
             skipped_reason: Some("no_third_party_provider_ids".to_string()),
             ..Default::default()
@@ -197,6 +229,12 @@ pub fn maybe_migrate_codex_provider_template_bucket(
 /// 迁移前 jsonl / state DB 均备份到 `~/.cc-switch/backups/codex-official-history-unify-v1/`。
 pub fn maybe_migrate_codex_official_history_to_unified_bucket(
 ) -> Result<CodexHistoryProviderBucketMigrationOutcome, AppError> {
+    if !offline_history_rewrite_allowed() {
+        return Ok(CodexHistoryProviderBucketMigrationOutcome {
+            skipped_reason: Some("offline_history_rewrite_required".to_string()),
+            ..Default::default()
+        });
+    }
     if !crate::settings::unify_codex_session_history() {
         return Ok(CodexHistoryProviderBucketMigrationOutcome {
             skipped_reason: Some("unify_toggle_off".to_string()),
@@ -220,21 +258,42 @@ pub fn maybe_migrate_codex_official_history_to_unified_bucket(
             ..Default::default()
         });
     }
-    // live 必须已实际路由到共享 custom 桶才允许迁移：官方配置的注入可能被拒
-    // （已有显式 model_provider / 形态冲突的 custom 表，见
-    // `inject_codex_unified_session_bucket`），代理接管期间的 live 也不带统一
-    // 路由（注入只进备份）。这些状态下新会话仍落 "openai" 桶，迁移只会把
-    // 历史搬进当前 live 看不见的桶里。开关与迁移意愿保持不动，待 live 真正
-    // 统一后（下次切换 / 接管释放后的启动重试）再迁。
-    if !codex_config_text_routes_custom(&read_codex_config_text().unwrap_or_default()) {
+    // live 必须已实际路由到共享 custom 桶，或是能无损改写为 custom 的旧
+    // `cc-switch` 路由，才允许迁移。官方代理接管现在也使用 custom，接管
+    // 成功后即可迁移；若统一路由注入因显式 model_provider 或 custom 表
+    // 冲突而被跳过，迁移意愿保持不动，待 live 真正统一后再重试。
+    let initial_live_config = read_codex_config_text().unwrap_or_default();
+    let legacy_live_rewrite = if codex_config_text_routes_legacy_shared(&initial_live_config) {
+        match rewrite_legacy_shared_live_route_to_custom(&initial_live_config)? {
+            Some(rewritten) => Some(rewritten),
+            None => {
+                return Ok(CodexHistoryProviderBucketMigrationOutcome {
+                    skipped_reason: Some("live_legacy_route_conflict".to_string()),
+                    ..Default::default()
+                });
+            }
+        }
+    } else {
+        None
+    };
+    if !codex_config_text_routes_custom(&initial_live_config) && legacy_live_rewrite.is_none() {
         return Ok(CodexHistoryProviderBucketMigrationOutcome {
             skipped_reason: Some("live_not_unified".to_string()),
             ..Default::default()
         });
     }
 
-    let source_provider_ids: BTreeSet<String> =
-        std::iter::once(OFFICIAL_OPENAI_CODEX_MODEL_PROVIDER_ID.to_string()).collect();
+    let source_provider_ids: BTreeSet<String> = [
+        OFFICIAL_OPENAI_CODEX_MODEL_PROVIDER_ID,
+        // v1 routed official proxy sessions through a separate provider id,
+        // which is the second half of the history split being repaired here.
+        CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID,
+        // Older cc-switch builds used this internal id for the same route.
+        LEGACY_CC_SWITCH_CODEX_MIGRATED_PROVIDER_ID,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
     let backup_root = migration_backup_root(OFFICIAL_UNIFY_MIGRATION_NAME);
     let migrated_jsonl_files =
         migrate_codex_jsonl_files(&codex_dir, &source_provider_ids, &backup_root)?;
@@ -242,6 +301,27 @@ pub fn maybe_migrate_codex_official_history_to_unified_bucket(
         migrate_codex_state_dbs(&codex_dir, &source_provider_ids, &backup_root)?;
     // 备份代际记录来源目录，restore 据此只取当前目录的账本。
     write_backup_generation_meta(&backup_root, &codex_dir_key)?;
+
+    // Older builds could leave the live selector on `cc-switch`. Migrate the
+    // history first, then atomically move that selector/table to `custom`, and
+    // only then write the completion marker. Compare with the exact text read
+    // above so a concurrent Codex/CC Switch config edit is never overwritten.
+    // A concurrent writer that already moved to `custom` is also acceptable;
+    // any other change leaves the marker unset and the idempotent migration
+    // retries next time.
+    if let Some(rewritten) = legacy_live_rewrite.as_deref() {
+        let current_live_config = read_codex_config_text().unwrap_or_default();
+        if current_live_config == initial_live_config {
+            write_codex_live_config_atomic(Some(rewritten))?;
+        } else if !codex_config_text_routes_custom(&current_live_config) {
+            return Ok(CodexHistoryProviderBucketMigrationOutcome {
+                source_provider_ids: source_provider_ids.iter().cloned().collect(),
+                migrated_jsonl_files,
+                migrated_state_rows,
+                skipped_reason: Some("live_changed_during_migration".to_string()),
+            });
+        }
+    }
 
     let outcome = CodexHistoryProviderBucketMigrationOutcome {
         source_provider_ids: source_provider_ids.into_iter().collect(),
@@ -257,6 +337,7 @@ pub fn maybe_migrate_codex_official_history_to_unified_bucket(
         CodexOfficialHistoryUnifyMigration {
             completed_at: Utc::now().to_rfc3339(),
             target_provider_id: CC_SWITCH_CODEX_MODEL_PROVIDER_ID.to_string(),
+            migration_version: crate::settings::CODEX_OFFICIAL_HISTORY_UNIFY_MIGRATION_VERSION,
             migrated_jsonl_files,
             migrated_state_rows,
             codex_config_dir: Some(codex_dir_key),
@@ -284,6 +365,63 @@ fn codex_config_text_routes_custom(config_text: &str) -> bool {
                 .map(|id| id.trim() == CC_SWITCH_CODEX_MODEL_PROVIDER_ID)
         })
         .unwrap_or(false)
+}
+
+fn codex_config_text_routes_legacy_shared(config_text: &str) -> bool {
+    config_text
+        .parse::<DocumentMut>()
+        .ok()
+        .and_then(|doc| {
+            doc.get("model_provider")
+                .and_then(|item| item.as_str())
+                .map(|id| id.trim() == LEGACY_CC_SWITCH_CODEX_MIGRATED_PROVIDER_ID)
+        })
+        .unwrap_or(false)
+}
+
+/// Rewrite the cc-switch-owned legacy live route without overwriting an
+/// existing `custom` table. `None` means the old selector cannot be mapped
+/// safely (missing source table or a conflicting destination table).
+fn rewrite_legacy_shared_live_route_to_custom(
+    config_text: &str,
+) -> Result<Option<String>, AppError> {
+    let mut doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+    if doc
+        .get("model_provider")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        != Some(LEGACY_CC_SWITCH_CODEX_MIGRATED_PROVIDER_ID)
+    {
+        return Ok(None);
+    }
+
+    let Some(providers) = doc
+        .get_mut("model_providers")
+        .and_then(toml_edit::Item::as_table_like_mut)
+    else {
+        return Ok(None);
+    };
+
+    let legacy_exists = providers
+        .get(LEGACY_CC_SWITCH_CODEX_MIGRATED_PROVIDER_ID)
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some();
+    let custom_exists = providers
+        .get(CC_SWITCH_CODEX_MODEL_PROVIDER_ID)
+        .and_then(toml_edit::Item::as_table_like)
+        .is_some();
+    if !legacy_exists || custom_exists {
+        return Ok(None);
+    }
+
+    let legacy = providers
+        .remove(LEGACY_CC_SWITCH_CODEX_MIGRATED_PROVIDER_ID)
+        .expect("legacy provider existence checked");
+    providers.insert(CC_SWITCH_CODEX_MODEL_PROVIDER_ID, legacy);
+    doc["model_provider"] = toml_edit::value(CC_SWITCH_CODEX_MODEL_PROVIDER_ID);
+    Ok(Some(doc.to_string()))
 }
 
 /// 目录的规范化字符串形式，用作 marker / 备份代际的目录身份。
@@ -353,6 +491,12 @@ fn has_official_history_unify_backup_for_dir(ledger_parent: &Path, codex_dir_key
 /// 且只改写当前仍为 custom 的目标，重复执行无害。
 pub fn restore_codex_official_history_from_backups(
 ) -> Result<CodexOfficialHistoryRestoreOutcome, AppError> {
+    if !offline_history_rewrite_allowed() {
+        return Ok(CodexOfficialHistoryRestoreOutcome {
+            skipped_reason: Some("offline_history_rewrite_required".to_string()),
+            ..Default::default()
+        });
+    }
     let _op_guard = lock_codex_official_history_op();
     // 开关已（重新）开启时拒绝还原：live 正路由 custom，把账本会话翻回
     // openai 桶等于亲手制造分裂。覆盖"关闭保存成功后用户立刻重新开启，
@@ -1025,6 +1169,11 @@ fn rewrite_codex_session_file_lines(
     backup_root: &Path,
     rewrite_line: impl Fn(&str) -> Option<String>,
 ) -> Result<bool, AppError> {
+    if !offline_history_rewrite_allowed() {
+        return Err(AppError::Message(
+            "Codex history rewrite requires an offline maintenance window".to_string(),
+        ));
+    }
     let metadata_before = fs::metadata(path).map_err(|e| AppError::io(path, e))?;
     let modified_before = metadata_before.modified().ok();
     let len_before = metadata_before.len();
@@ -1053,6 +1202,11 @@ fn rewrite_codex_session_file_lines(
     ensure_codex_session_file_unchanged(path, modified_before, len_before)?;
     backup_codex_jsonl_file(path, codex_dir, backup_root)?;
     ensure_codex_session_file_unchanged(path, modified_before, len_before)?;
+    if !offline_history_rewrite_allowed() {
+        return Err(AppError::Message(
+            "Codex started during history migration; session file was not replaced".to_string(),
+        ));
+    }
     atomic_write(path, rewritten.as_bytes())?;
     Ok(true)
 }

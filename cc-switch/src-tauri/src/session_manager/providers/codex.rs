@@ -62,10 +62,25 @@ fn scan_sessions_in_roots_with_titles(
         collect_jsonl_files(root, &mut files);
     }
 
-    let mut sessions = Vec::new();
+    let mut sessions: Vec<SessionMeta> = Vec::new();
+    let mut session_positions: HashMap<String, usize> = HashMap::new();
     for path in files {
         if let Some(meta) = parse_session_with_titles(&path, thread_titles) {
-            sessions.push(meta);
+            // A session may temporarily exist in both active and archived
+            // directories during a move or recovery. Its Codex ID, rather
+            // than its file path or model, defines the conversation shown in
+            // CC Switch. Keep the most recently active copy under one entry.
+            if let Some(&position) = session_positions.get(&meta.session_id) {
+                let current = &sessions[position];
+                let current_time = current.last_active_at.or(current.created_at).unwrap_or(0);
+                let candidate_time = meta.last_active_at.or(meta.created_at).unwrap_or(0);
+                if candidate_time > current_time {
+                    sessions[position] = meta;
+                }
+            } else {
+                session_positions.insert(meta.session_id.clone(), sessions.len());
+                sessions.push(meta);
+            }
         }
     }
 
@@ -386,7 +401,9 @@ fn parse_session_with_titles(
         }
     }
 
-    let session_id = session_id.or_else(|| infer_session_id_from_filename(path));
+    let session_id = session_id
+        .filter(|id| !id.trim().is_empty())
+        .or_else(|| infer_session_id_from_filename(path));
     let session_id = session_id?;
 
     let title = thread_titles
@@ -538,6 +555,17 @@ mod tests {
         .expect("write session");
     }
 
+    fn write_codex_session_at(path: &Path, session_id: &str, message: &str, timestamp: &str) {
+        std::fs::write(
+            path,
+            format!(
+                "{{\"timestamp\":\"{timestamp}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"cwd\":\"/tmp/project\"}}}}\n\
+                 {{\"timestamp\":\"{timestamp}\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":\"{message}\"}}}}\n",
+            ),
+        )
+        .expect("write session");
+    }
+
     #[test]
     fn scan_sessions_in_roots_includes_active_and_archived_files() {
         let temp = tempdir().expect("tempdir");
@@ -561,6 +589,74 @@ mod tests {
 
         assert!(ids.contains(&"active-id".to_string()));
         assert!(ids.contains(&"archived-id".to_string()));
+    }
+
+    #[test]
+    fn scan_sessions_keeps_single_entry_for_shared_session_id() {
+        let temp = tempdir().expect("tempdir");
+        let active = temp.path().join("sessions");
+        let archived = temp.path().join("archived_sessions");
+        std::fs::create_dir_all(&active).expect("active dir");
+        std::fs::create_dir_all(&archived).expect("archived dir");
+
+        let session_id = "019cc369-bd7c-7891-b371-7b20b4fe0b18";
+        let older_name = format!("rollout-2026-03-06T21-50-12-{session_id}.jsonl");
+        let newer_name =
+            format!("rollout-2026-03-07T09-10-11-{session_id}_019cc3a7-bd7c-7891-b371-7b20b4fe0b18.jsonl");
+        write_codex_session_at(
+            &active.join(&older_name),
+            session_id,
+            "Older turn",
+            "2026-03-06T21:50:12Z",
+        );
+        write_codex_session_at(
+            &archived.join(&newer_name),
+            session_id,
+            "Latest turn",
+            "2026-03-07T09:10:11Z",
+        );
+
+        let sessions = scan_sessions_in_roots(&[active.clone(), archived.clone()]);
+
+        assert_eq!(
+            sessions.len(),
+            1,
+            "同一个会话 ID 在活动目录与归档目录各有一份时只能显示一条"
+        );
+        let session = &sessions[0];
+        assert_eq!(session.session_id, session_id);
+        assert_eq!(session.title.as_deref(), Some("Latest turn"));
+        assert_eq!(
+            session.last_active_at,
+            parse_timestamp_to_ms(&serde_json::json!("2026-03-07T09:10:11Z"))
+        );
+        assert_eq!(
+            Path::new(session.source_path.as_deref().expect("source path"))
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some(newer_name.as_str())
+        );
+    }
+
+    #[test]
+    fn parse_session_falls_back_to_filename_when_meta_id_is_blank() {
+        let temp = tempdir().expect("tempdir");
+        let session_id = "019cc369-bd7c-7891-b371-7b20b4fe0b18";
+        let path = temp
+            .path()
+            .join(format!("rollout-2026-03-06T21-50-12-{session_id}.jsonl"));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"timestamp\":\"2026-03-06T21:50:12Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"\",\"cwd\":\"/tmp/project\"}}\n",
+                "{\"timestamp\":\"2026-03-06T21:50:13Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"hello\"}}\n"
+            ),
+        )
+        .expect("write session");
+
+        let session = parse_session(&path).expect("session parsed");
+
+        assert_eq!(session.session_id, session_id);
     }
 
     #[test]

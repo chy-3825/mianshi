@@ -106,6 +106,280 @@ fn switch_provider_internal(
     ProviderService::switch(state, app_type, id)
 }
 
+async fn switch_codex_normal_while_locked(
+    app_handle: tauri::AppHandle,
+    id: String,
+    providers: IndexMap<String, Provider>,
+) -> Result<SwitchResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle
+            .try_state::<AppState>()
+            .ok_or_else(|| "应用状态不可用".to_string())?;
+        ProviderService::switch_normal(state.inner(), AppType::Codex, &id, &providers)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("Codex 供应商切换任务执行失败: {error}"))?
+}
+
+async fn rollback_codex_route_activation(
+    state: &AppState,
+    previous_db_current: Option<&str>,
+    previous_local_current: Option<&str>,
+    snapshot: &crate::codex_config::CodexLiveStateSnapshot,
+    server_was_running: bool,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let app = AppType::Codex;
+
+    match state.db.get_proxy_config_for_app(app.as_str()).await {
+        Ok(config) if config.enabled => {
+            if let Err(error) = state
+                .proxy_service
+                .set_takeover_for_app_locked(&app, false)
+                .await
+            {
+                failures.push(format!("关闭半完成的 Codex 接管失败: {error}"));
+            }
+        }
+        Ok(_) => {
+            // Activation can fail after writing the Live placeholder but
+            // before committing enabled=true. Keep the backup until its
+            // restore path has had a chance to run.
+            let has_backup = match state.db.get_live_backup(app.as_str()).await {
+                Ok(backup) => backup.is_some(),
+                Err(error) => {
+                    failures.push(format!("检查 Codex 接管备份失败: {error}"));
+                    false
+                }
+            };
+            if has_backup
+                || state
+                    .proxy_service
+                    .detect_takeover_in_live_config_for_app(&app)
+            {
+                if let Err(error) = state
+                    .proxy_service
+                    .restore_live_config_for_app_with_fallback_inner(&app)
+                    .await
+                {
+                    failures.push(format!("恢复 Codex 接管配置失败: {error}"));
+                } else if let Err(error) = state.db.delete_live_backup(app.as_str()).await {
+                    failures.push(format!("清理 Codex 接管备份失败: {error}"));
+                }
+            }
+        }
+        Err(error) => failures.push(format!("检查 Codex 接管状态失败: {error}")),
+    }
+
+    let restore_db_current = match previous_db_current {
+        Some(previous_id) => state.db.set_current_provider(app.as_str(), previous_id),
+        None => state.db.clear_current_provider(app.as_str()),
+    };
+    if let Err(error) = restore_db_current {
+        failures.push(format!("恢复数据库当前卡片失败: {error}"));
+    }
+    if let Err(error) = crate::settings::set_current_provider(&app, previous_local_current) {
+        failures.push(format!("恢复本地当前卡片失败: {error}"));
+    }
+    if let Err(error) = snapshot.restore_preserving_newer_same_account_auth() {
+        failures.push(format!("恢复 Codex 登录与配置失败: {error}"));
+    }
+    if !server_was_running && state.proxy_service.is_running().await {
+        match state.proxy_service.get_takeover_status().await {
+            Ok(status)
+                if !status.claude && !status.codex && !status.gemini && !status.grokbuild =>
+            {
+                if let Err(error) = state.proxy_service.stop().await {
+                    failures.push(format!("停止新启动的本地路由失败: {error}"));
+                }
+            }
+            Ok(_) => {}
+            Err(error) => failures.push(format!("检查其他应用接管状态失败: {error}")),
+        }
+    }
+    failures
+}
+
+async fn switch_codex_provider(
+    app_handle: tauri::AppHandle,
+    id: String,
+) -> Result<SwitchResult, String> {
+    use crate::services::provider::{
+        codex_official_proxy_takeover_binding_error, codex_provider_needs_local_route,
+    };
+
+    let state = app_handle
+        .try_state::<AppState>()
+        .ok_or_else(|| "应用状态不可用".to_string())?;
+    let app = AppType::Codex;
+    let _guard = state.proxy_service.lock_switch_for_app(app.as_str()).await;
+    let providers = state
+        .db
+        .get_all_providers(app.as_str())
+        .map_err(|error| error.to_string())?;
+    let target = providers
+        .get(&id)
+        .ok_or_else(|| format!("供应商 {id} 不存在"))?;
+    let needs_route = codex_provider_needs_local_route(target);
+    let has_managed_official_account = target
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+        .is_some_and(|account_id| !account_id.trim().is_empty());
+    let native_official = codex_official_proxy_takeover_binding_error(&app, target).is_some()
+        || (target.category.as_deref() == Some("official") && !has_managed_official_account);
+    let has_backup = state
+        .db
+        .get_live_backup(app.as_str())
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some();
+    let live_taken_over = state
+        .proxy_service
+        .detect_takeover_in_live_config_for_app(&app);
+    let takeover_enabled = state
+        .db
+        .get_proxy_config_for_app(app.as_str())
+        .await
+        .map_err(|error| error.to_string())?
+        .enabled;
+    let taken_over = takeover_enabled && has_backup && live_taken_over;
+    if !taken_over && (takeover_enabled || has_backup || live_taken_over) {
+        // A partial takeover must be restored before a normal switch reads
+        // Live for backfill. The release path also handles enabled=false now.
+        state
+            .proxy_service
+            .set_takeover_for_app_locked(&app, false)
+            .await
+            .map_err(|error| format!("恢复未完成的 Codex 接管失败: {error}"))?;
+    }
+
+    if taken_over && !native_official {
+        // Live already points to localhost. Recreate the server before the
+        // target changes, otherwise a successful hot switch can leave Codex
+        // reporting "Connection refused" on its next request.
+        if !state.proxy_service.is_running().await {
+            state
+                .proxy_service
+                .start()
+                .await
+                .map_err(|error| format!("启动 Codex 本地路由失败，卡片未切换: {error}"))?;
+        }
+        state
+            .proxy_service
+            .set_takeover_for_app_locked(&app, true)
+            .await
+            .map_err(|error| format!("恢复 Codex 本地接管失败，卡片未切换: {error}"))?;
+        state
+            .proxy_service
+            .hot_switch_provider_inner(app.as_str(), &id)
+            .await
+            .map_err(|error| format!("热切换失败: {error}"))?;
+        return Ok(SwitchResult::default());
+    }
+
+    if taken_over && native_official {
+        // A native ChatGPT login must use Codex's own route. If the normal
+        // switch fails, restore the prior local takeover before returning.
+        if let Err(error) = state
+            .proxy_service
+            .set_takeover_for_app_locked(&app, false)
+            .await
+        {
+            if let Err(restore_error) = state
+                .proxy_service
+                .set_takeover_for_app_locked(&app, true)
+                .await
+            {
+                return Err(format!(
+                    "关闭 Codex 接管失败: {error}; 恢复原本地路由也失败: {restore_error}"
+                ));
+            }
+            return Err(format!("关闭 Codex 接管失败，已恢复原本地路由: {error}"));
+        }
+        let result = switch_codex_normal_while_locked(app_handle.clone(), id, providers).await;
+        if let Err(error) = result {
+            if let Err(restore_error) = state
+                .proxy_service
+                .set_takeover_for_app_locked(&app, true)
+                .await
+            {
+                return Err(format!(
+                    "切换官方卡片失败: {error}; 恢复原本地路由也失败: {restore_error}"
+                ));
+            }
+            return Err(error);
+        }
+        return result;
+    }
+
+    if !needs_route {
+        return switch_codex_normal_while_locked(app_handle.clone(), id, providers).await;
+    }
+
+    let managed_official = has_managed_official_account
+        && (target.category.as_deref() == Some("official")
+            || crate::proxy::providers::is_codex_official_provider(target));
+    // A non-managed route target briefly uses the normal Codex live writer.
+    // Refuse to erase a native ChatGPT login when preservation is disabled.
+    // Managed official cards use a staged takeover and never write auth.json.
+    if !managed_official && !crate::settings::preserve_codex_official_auth_on_switch() {
+        return Err(
+            "请先在设置中开启「切换 Codex 供应商时保留官方登录」；本地路由切换不会自动修改该设置或删除官方登录。".to_string(),
+        );
+    }
+    let previous_db_current = state
+        .db
+        .get_current_provider(app.as_str())
+        .map_err(|error| error.to_string())?;
+    let previous_local_current = crate::settings::get_current_provider(&app);
+    let snapshot = crate::codex_config::CodexLiveStateSnapshot::capture()
+        .map_err(|error| error.to_string())?;
+    let server_was_running = state.proxy_service.is_running().await;
+    let result = if managed_official {
+        // Staging a managed official card changes only current. Its local
+        // takeover writer keeps the existing native auth.json untouched.
+        state
+            .proxy_service
+            .hot_switch_provider_inner(app.as_str(), &id)
+            .await
+            .map_err(|error| format!("选择 Codex 托管官方卡片失败: {error}"))?;
+        SwitchResult::default()
+    } else {
+        switch_codex_normal_while_locked(app_handle.clone(), id, providers).await?
+    };
+    let activate_result = if managed_official {
+        state
+            .proxy_service
+            .activate_staged_codex_takeover_locked()
+            .await
+    } else {
+        state
+            .proxy_service
+            .set_takeover_for_app_locked(&app, true)
+            .await
+    };
+    if let Err(error) = activate_result {
+        let rollback_failures = rollback_codex_route_activation(
+            state.inner(),
+            previous_db_current.as_deref(),
+            previous_local_current.as_deref(),
+            &snapshot,
+            server_was_running,
+        )
+        .await;
+        if rollback_failures.is_empty() {
+            return Err(format!("启动 Codex 本地路由失败，已恢复原卡片: {error}"));
+        }
+        return Err(format!(
+            "启动 Codex 本地路由失败: {error}; 回滚同时失败: {}",
+            rollback_failures.join("; ")
+        ));
+    }
+    Ok(result)
+}
+
 #[cfg_attr(not(feature = "test-hooks"), doc(hidden))]
 pub fn switch_provider_test_hook(
     state: &AppState,
@@ -122,6 +396,9 @@ pub async fn switch_provider(
     id: String,
 ) -> Result<SwitchResult, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    if matches!(app_type, AppType::Codex) {
+        return switch_codex_provider(app_handle, id).await;
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle
             .try_state::<AppState>()

@@ -50,12 +50,62 @@ use live::{
 };
 use usage::validate_usage_script;
 
-/// Codex official providers are safe to select during takeover: Codex keeps
-/// ownership of the active ChatGPT login and the proxy only forwards the
-/// authenticated request. Other apps' official providers retain the block.
+/// A native official Codex login stays outside local routing until the
+/// official card is bound to a CC Switch-managed account.
+pub fn codex_official_proxy_takeover_binding_error(
+    app_type: &AppType,
+    provider: &Provider,
+) -> Option<&'static str> {
+    if !matches!(app_type, AppType::Codex)
+        || (provider.id != crate::database::CODEX_OFFICIAL_PROVIDER_ID
+            && !crate::proxy::providers::is_codex_official_provider(provider))
+    {
+        return None;
+    }
+    let has_managed_account = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+        .is_some_and(|account_id| !account_id.trim().is_empty());
+    (!has_managed_account).then_some(
+        "该 OpenAI 官方卡片未绑定 CC Switch 托管的 ChatGPT 账号。请先在 CC Switch 认证中心登录并绑定账号；如需使用 Codex 原生登录，请先关闭 Codex 代理接管。",
+    )
+}
+
+/// Codex speaks Responses natively. Chat, Anthropic and full-URL cards need
+/// CC Switch's own local request router; managed OAuth also needs its token
+/// injection. This decision is enforced by the backend switch command, not
+/// only by the card badge.
+pub fn codex_provider_needs_local_route(provider: &Provider) -> bool {
+    if provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+        .is_some_and(|account_id| !account_id.trim().is_empty())
+    {
+        return true;
+    }
+    if provider.category.as_deref() == Some("official")
+        || crate::proxy::providers::is_codex_official_provider(provider)
+    {
+        return false;
+    }
+
+    provider.uses_proxy_injected_oauth()
+        || provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.is_full_url)
+            .unwrap_or(false)
+        || crate::proxy::providers::codex_provider_uses_chat_completions(provider)
+        || crate::proxy::providers::codex_provider_uses_anthropic(provider)
+}
+
+/// Other apps' official providers retain the takeover block.
 pub fn official_provider_supports_proxy_takeover(app_type: &AppType, provider: &Provider) -> bool {
     matches!(app_type, AppType::Codex)
         && crate::proxy::providers::is_codex_official_provider(provider)
+        && codex_official_proxy_takeover_binding_error(app_type, provider).is_none()
 }
 
 /// 统一会话开关变更后，立即按新开关状态重写当前官方 Codex 供应商的
@@ -77,8 +127,8 @@ pub fn reapply_current_codex_official_live(state: &AppState) -> Result<bool, App
         return Ok(false);
     }
 
-    // 代理接管期间 live 归代理所有（开启代理时官方供应商只警告不拦截，
-    // 二者可以共存）。与切换/保存路径一致：以 backup/占位符为所有权信号，
+    // 代理接管期间 live 归代理所有。联合受管模式要求官方卡已绑定账号；
+    // 独立模式保留原生登录。与切换/保存路径一致：以 backup/占位符为所有权信号，
     // 只更新备份，注入后的配置由接管释放时的恢复路径落盘。
     let outcome =
         live::sync_live_for_provider_respecting_takeover(state, &AppType::Codex, provider)?;
@@ -5235,8 +5285,16 @@ impl ProviderService {
 
         let should_hot_switch = is_app_taken_over || live_taken_over;
 
-        // Block switching to unsupported official providers when proxy takeover
-        // is active. Codex official account cards use native auth passthrough.
+        // A proxied official Codex card must have a CC Switch-managed account.
+        // Direct/native official login remains available after takeover ends.
+        if should_hot_switch {
+            if let Some(message) = codex_official_proxy_takeover_binding_error(&app_type, _provider)
+            {
+                return Err(AppError::Message(message.to_string()));
+            }
+        }
+
+        // Block unsupported official providers while proxy takeover is active.
         if should_hot_switch
             && _provider.category.as_deref() == Some("official")
             && !official_provider_supports_proxy_takeover(&app_type, _provider)
@@ -5275,7 +5333,7 @@ impl ProviderService {
     }
 
     /// Normal switch flow (non-proxy mode)
-    fn switch_normal(
+    pub(crate) fn switch_normal(
         state: &AppState,
         app_type: AppType,
         id: &str,
@@ -5368,11 +5426,16 @@ impl ProviderService {
 
         // 提交 current 前预检托管 Codex token（见 preflight_managed_codex_live）。
         let preflighted_provider = Self::preflight_managed_codex_live(state, &app_type, provider)?;
-        let use_managed_codex_transaction = matches!(app_type, AppType::Codex)
-            && (current_managed_codex_account_id.is_some()
-                || target_managed_codex_account_id.is_some());
+        // Every Codex switch can change the live config. If writing it fails
+        // after current is committed, the DB points at a card Codex never
+        // loaded and the next switch can backfill the wrong card from disk.
+        // Apply the same snapshot/rollback transaction to API-key cards too.
+        let use_codex_transaction = matches!(app_type, AppType::Codex);
+        if use_codex_transaction && preflighted_provider.is_none() {
+            live::preflight_codex_live_write_for_state(state, provider)?;
+        }
 
-        if use_managed_codex_transaction {
+        if use_codex_transaction {
             // auth/config/catalog/marker form one logical live commit. Write them
             // before current, then restore the exact four-file snapshot on any
             // failure so native logins and CLI-rotated tokens are not reconstructed
@@ -5422,15 +5485,6 @@ impl ProviderService {
                 ));
             }
         } else {
-            // Codex: validate the live projection before committing current —
-            // the write-layer safety gates can refuse the switch, and a
-            // refusal after current moved would let the next switch backfill
-            // the old live config into the new provider's DB row. (The
-            // managed branch above has its own snapshot rollback instead.)
-            if matches!(app_type, AppType::Codex) && preflighted_provider.is_none() {
-                live::preflight_codex_live_write_for_state(state, provider)?;
-            }
-
             // Additive mode apps skip setting is_current (no such concept).
             if !app_type.is_additive_mode() {
                 crate::settings::set_current_provider(&app_type, Some(id))?;

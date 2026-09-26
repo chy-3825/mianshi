@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# User-level CC Switch entry point.
+set -euo pipefail
+
+cc_switch_binary="${HOME}/.local/bin/cc-switch-current"
+if [[ ! -x "$cc_switch_binary" ]]; then
+  printf 'CC Switch: 未找到已安装的程序：%s\n' "$cc_switch_binary" >&2
+  exit 127
+fi
+
+# Ignore inherited proxy variables; the application's global proxy setting is
+# the explicit outbound proxy choice.
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
+unset http_proxy https_proxy all_proxy no_proxy
+unset CC_SWITCH_CODEX_HISTORY_MIGRATION_OFFLINE
+export CC_SWITCH_STANDALONE_LAUNCHER=1
+
+exec -a cc-switch "$cc_switch_binary" "$@"

@@ -184,7 +184,7 @@ pub fn update_proxy(proxy_url: Option<&str>) -> Result<(), String> {
 
 /// 获取全局 HTTP 客户端
 ///
-/// 返回配置了代理的客户端（如果已配置代理），否则返回跟随系统代理的客户端。
+/// 返回配置了代理的客户端（如果已配置代理），否则返回直连客户端。
 pub fn get() -> Client {
     GLOBAL_CLIENT
         .get()
@@ -226,7 +226,7 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
         .no_deflate()
         .no_zstd();
 
-    // 有代理地址则使用代理，否则跟随系统代理
+    // 有显式代理地址则使用代理；直连模式忽略残留的环境代理变量。
     if let Some(url) = proxy_url {
         // 先验证 URL 格式和 scheme
         let parsed = url::Url::parse(url)
@@ -246,16 +246,14 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
         builder = builder.proxy(proxy);
         log::debug!("[GlobalProxy] Proxy configured: {}", mask_url(url));
     } else {
-        // 未设置全局代理时，让 reqwest 自动检测系统代理（环境变量）
-        // 若系统代理指向本机，禁用系统代理避免自环
+        // Direct mode must also ignore environment proxy variables.
         if system_proxy_points_to_loopback() {
-            builder = builder.no_proxy();
             log::warn!(
-                "[GlobalProxy] System proxy points to localhost, bypassing to avoid recursion"
+                "[GlobalProxy] Ignoring a loopback system proxy because direct mode is selected"
             );
-        } else {
-            log::debug!("[GlobalProxy] Following system proxy (no explicit proxy configured)");
         }
+        builder = builder.no_proxy();
+        log::debug!("[GlobalProxy] Direct connection (no explicit proxy configured)");
     }
 
     builder

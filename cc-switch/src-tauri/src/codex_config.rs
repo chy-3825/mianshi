@@ -16,13 +16,12 @@ use std::process::{Command, Stdio};
 use toml_edit::DocumentMut;
 
 pub const CC_SWITCH_CODEX_MODEL_PROVIDER_ID: &str = "custom";
-/// Temporary model-provider id used while the built-in `codex-official`
-/// provider is routed through CC Switch.  A dedicated id is an ownership
-/// marker: unlike a generic localhost `base_url`, it can be detected and
-/// cleaned up without mistaking a user's own local provider for takeover.
+/// Legacy model-provider id used by older CC Switch builds while the built-in
+/// `codex-official` provider was routed through CC Switch.
 pub const CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID: &str = "cc-switch-official";
 pub const CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME: &str = "cc-switch-model-catalog.json";
 const CODEX_PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
+const CODEX_OFFICIAL_PROXY_ROUTE_MARKER: &str = "# cc-switch-managed-official-proxy-v2";
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -686,6 +685,9 @@ pub fn codex_auth_matches_recorded_managed_oauth(
     };
     let auth_user_identity = extract_codex_auth_user_identity(auth);
     let marker_path = get_codex_managed_oauth_live_auth_marker_path();
+    if !marker_path.exists() {
+        return Ok(false);
+    }
     let marker: CodexManagedOAuthLiveAuthMarker = match read_json_file(&marker_path) {
         Ok(marker) => marker,
         Err(err) => {
@@ -762,6 +764,12 @@ fn clear_codex_managed_oauth_live_auth_marker_for_account(
         delete_file(&marker_path)?;
     }
     Ok(())
+}
+
+/// Stop treating Codex's live auth.json as a synchronization peer for a
+/// managed account, without deleting or rewriting the credential file.
+pub fn detach_codex_managed_oauth_live_auth(account_id: &str) -> Result<(), AppError> {
+    clear_codex_managed_oauth_live_auth_marker_for_account(account_id)
 }
 
 /// 切走托管 provider 或从认证中心删除账号时，清理其残留在
@@ -3510,12 +3518,92 @@ fn remove_codex_proxy_placeholders_from_providers(providers: &mut toml_edit::Tab
     }
 }
 
-/// Project a Codex official account card through the local proxy while keeping
-/// authentication owned by Codex itself.
+fn codex_official_proxy_route_marker_present(config_text: &str) -> bool {
+    config_text
+        .lines()
+        .any(|line| line.trim() == CODEX_OFFICIAL_PROXY_ROUTE_MARKER)
+}
+
+fn strip_codex_official_proxy_route_marker(config_text: &str) -> String {
+    let mut stripped = String::with_capacity(config_text.len());
+    for segment in config_text.split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.trim() == CODEX_OFFICIAL_PROXY_ROUTE_MARKER {
+            continue;
+        }
+        stripped.push_str(segment);
+    }
+    stripped
+}
+
+fn table_matches_codex_official_proxy_provider(table: &dyn toml_edit::TableLike) -> bool {
+    let base_url_is_cc_switch_local = table
+        .get("base_url")
+        .and_then(|item| item.as_str())
+        .is_some_and(|base_url| {
+            let Ok(url) = url::Url::parse(base_url.trim()) else {
+                return false;
+            };
+            url.scheme() == "http"
+                && url
+                    .host_str()
+                    .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+                    .is_some_and(|host| host.is_loopback())
+                && url.port().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && url.path().trim_end_matches('/') == "/v1"
+        });
+    let requires_openai_auth = table
+        .get("requires_openai_auth")
+        .and_then(|item| item.as_bool());
+    let proxy_bearer = table
+        .get("experimental_bearer_token")
+        .and_then(|item| item.as_str());
+
+    // Two consecutive shapes belong to the same CC Switch route:
+    // - projection: native/unbound official passthrough (`true`, no token);
+    // - managed official: the proxy owns OAuth (`false`, PROXY_MANAGED).
+    // The marker plus an exact loopback table shape prevents fallback cleanup
+    // from deleting a user-authored `custom` provider.
+    let auth_shape_is_valid = matches!(
+        (requires_openai_auth, proxy_bearer),
+        (Some(true), None) | (Some(false), Some(CODEX_PROXY_AUTH_PLACEHOLDER))
+    );
+
+    matches!(table.iter().count(), 5 | 6)
+        && table.get("name").and_then(|item| item.as_str()) == Some("OpenAI")
+        && auth_shape_is_valid
+        && table
+            .get("supports_websockets")
+            .and_then(|item| item.as_bool())
+            == Some(false)
+        && table.get("wire_api").and_then(|item| item.as_str()) == Some("responses")
+        && base_url_is_cc_switch_local
+        && table.iter().all(|(key, _)| {
+            matches!(
+                key,
+                "name"
+                    | "requires_openai_auth"
+                    | "supports_websockets"
+                    | "wire_api"
+                    | "base_url"
+                    | "experimental_bearer_token"
+            )
+        })
+}
+
+/// Project a Codex official account card through the local proxy in the shared
+/// `custom` history bucket.
 ///
-/// The resulting custom provider explicitly opts into OpenAI authentication,
-/// so Codex forwards its existing ChatGPT login to the local `/responses`
-/// endpoint.  No API key or bearer placeholder is written to `auth.json`.
+/// Unbound cards can use the native ChatGPT login. A managed card later gets
+/// `PROXY_MANAGED` and `requires_openai_auth = false` in config.toml; CC Switch
+/// then owns the OAuth token and leaves Codex's auth.json untouched.
+/// A comment marker records that CC Switch owns this otherwise generic custom
+/// route, allowing cleanup without touching a user's own `custom` provider.
 pub fn apply_codex_official_proxy_route(
     config_text: &str,
     proxy_base_url: &str,
@@ -3524,10 +3612,10 @@ pub fn apply_codex_official_proxy_route(
         .parse::<DocumentMut>()
         .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
 
-    // A third-party takeover may have left the proxy placeholder in config.toml.
-    // The official route must use Codex's native OpenAI login instead.
+    // A third-party takeover may have left a top-level proxy placeholder.
+    // The official table receives its own credential policy later.
     doc.as_table_mut().remove("experimental_bearer_token");
-    doc["model_provider"] = toml_edit::value(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID);
+    doc["model_provider"] = toml_edit::value(CC_SWITCH_CODEX_MODEL_PROVIDER_ID);
 
     let mut providers = match doc.as_table_mut().remove("model_providers") {
         Some(item) => item.into_table().map_err(|_| {
@@ -3549,29 +3637,46 @@ pub fn apply_codex_official_proxy_route(
     // The local proxy currently exposes HTTP/SSE, not Codex websocket routes.
     let table = codex_official_provider_table(Some(proxy_base_url), false);
 
+    // Older builds used a separate provider id. Remove it when upgrading so
+    // the active provider and the history bucket cannot diverge again.
+    providers.remove(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID);
     providers.insert(
-        CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID,
+        CC_SWITCH_CODEX_MODEL_PROVIDER_ID,
         toml_edit::Item::Table(table),
     );
     doc["model_providers"] = toml_edit::Item::Table(providers);
-    Ok(doc.to_string())
+    let rendered = doc.to_string();
+    if codex_official_proxy_route_marker_present(&rendered) {
+        Ok(rendered)
+    } else {
+        Ok(format!("{CODEX_OFFICIAL_PROXY_ROUTE_MARKER}\n{rendered}"))
+    }
 }
 
 /// Whether a live Codex config is the official route projected by CC Switch.
 pub fn codex_config_has_official_proxy_route(config_text: &str) -> bool {
-    if !config_text.contains(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID) {
+    let Ok(doc) = config_text.parse::<DocumentMut>() else {
+        return false;
+    };
+    let Some(active_provider) = doc.get("model_provider").and_then(|item| item.as_str()) else {
+        return false;
+    };
+
+    // Keep recognizing the old route so an upgrade can clean it up safely.
+    if active_provider == CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID {
+        return true;
+    }
+    if active_provider != CC_SWITCH_CODEX_MODEL_PROVIDER_ID
+        || !codex_official_proxy_route_marker_present(config_text)
+    {
         return false;
     }
-    config_text
-        .parse::<DocumentMut>()
-        .ok()
-        .and_then(|doc| {
-            doc.get("model_provider")
-                .and_then(|item| item.as_str())
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
+
+    doc.get("model_providers")
+        .and_then(|item| item.as_table_like())
+        .and_then(|providers| providers.get(CC_SWITCH_CODEX_MODEL_PROVIDER_ID))
+        .and_then(|item| item.as_table_like())
+        .is_some_and(table_matches_codex_official_proxy_provider)
 }
 
 /// Remove only the official takeover route owned by CC Switch. This is a
@@ -3580,9 +3685,22 @@ pub fn remove_codex_official_proxy_route(config_text: &str) -> Result<String, Ap
     let mut doc = config_text
         .parse::<DocumentMut>()
         .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
-    if doc.get("model_provider").and_then(|item| item.as_str())
-        != Some(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
-    {
+    let active_provider = doc
+        .get("model_provider")
+        .and_then(|item| item.as_str())
+        .map(str::to_string);
+    let is_legacy_route =
+        active_provider.as_deref() == Some(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID);
+    let is_managed_custom_route = active_provider.as_deref()
+        == Some(CC_SWITCH_CODEX_MODEL_PROVIDER_ID)
+        && codex_official_proxy_route_marker_present(config_text)
+        && doc
+            .get("model_providers")
+            .and_then(|item| item.as_table_like())
+            .and_then(|providers| providers.get(CC_SWITCH_CODEX_MODEL_PROVIDER_ID))
+            .and_then(|item| item.as_table_like())
+            .is_some_and(table_matches_codex_official_proxy_provider);
+    if !is_legacy_route && !is_managed_custom_route {
         return Ok(config_text.to_string());
     }
 
@@ -3593,13 +3711,19 @@ pub fn remove_codex_official_proxy_route(config_text: &str) -> Result<String, Ap
                 "Invalid Codex config.toml: model_providers must be a table".to_string(),
             )
         })?;
-        providers.remove(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID);
+        if is_legacy_route {
+            providers.remove(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID);
+        } else {
+            providers.remove(CC_SWITCH_CODEX_MODEL_PROVIDER_ID);
+            // Remove a stale alias left by an older build in the same pass.
+            providers.remove(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID);
+        }
         remove_codex_proxy_placeholders_from_providers(&mut providers);
         if !providers.is_empty() {
             doc["model_providers"] = toml_edit::Item::Table(providers);
         }
     }
-    Ok(doc.to_string())
+    Ok(strip_codex_official_proxy_route_marker(&doc.to_string()))
 }
 
 fn table_matches_codex_unified_official_provider(table: &toml_edit::Table) -> bool {
@@ -3670,6 +3794,11 @@ pub fn inject_codex_unified_session_bucket(config_text: &str) -> Result<String, 
 /// 切换即可完全还原）。仅当形态与注入产物完全一致时才剥离；第三方模板和
 /// 用户自定义的 `custom` 条目（带 base_url 等差异字段）原样保留。
 pub fn strip_codex_unified_session_bucket(config_text: &str) -> Result<String, AppError> {
+    // The official takeover route also uses custom. Remove its owned table
+    // before saving a provider snapshot, without touching user custom routes.
+    if codex_config_has_official_proxy_route(config_text) {
+        return remove_codex_official_proxy_route(config_text);
+    }
     if !config_text.contains("model_provider") {
         return Ok(config_text.to_string());
     }
@@ -4501,7 +4630,7 @@ command = "example"
 
         assert_eq!(
             doc.get("model_provider").and_then(toml::Value::as_str),
-            Some(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
+            Some(CC_SWITCH_CODEX_MODEL_PROVIDER_ID)
         );
         assert!(doc.get("experimental_bearer_token").is_none());
         assert!(
@@ -4509,7 +4638,7 @@ command = "example"
             "unrelated config survives"
         );
 
-        let provider = &doc["model_providers"][CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID];
+        let provider = &doc["model_providers"][CC_SWITCH_CODEX_MODEL_PROVIDER_ID];
         assert_eq!(
             provider.get("base_url").and_then(toml::Value::as_str),
             Some("http://127.0.0.1:15721/v1")
@@ -4526,6 +4655,8 @@ command = "example"
                 .and_then(toml::Value::as_bool),
             Some(false)
         );
+        assert!(output.contains(CODEX_OFFICIAL_PROXY_ROUTE_MARKER));
+        assert!(!output.contains(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID));
         assert!(codex_config_has_official_proxy_route(&output));
     }
 
@@ -4567,7 +4698,7 @@ model_providers = { rightcode = { name = "RightCode", experimental_bearer_token 
             .get("experimental_bearer_token")
             .is_none());
         assert!(projected_doc["model_providers"]
-            .get(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
+            .get(CC_SWITCH_CODEX_MODEL_PROVIDER_ID)
             .is_some());
 
         let cleaned = remove_codex_official_proxy_route(&projected).expect("clean projected");
@@ -4575,8 +4706,9 @@ model_providers = { rightcode = { name = "RightCode", experimental_bearer_token 
         assert!(cleaned_doc.get("model_provider").is_none());
         assert!(cleaned_doc["model_providers"].get("rightcode").is_some());
         assert!(cleaned_doc["model_providers"]
-            .get(CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
+            .get(CC_SWITCH_CODEX_MODEL_PROVIDER_ID)
             .is_none());
+        assert!(!cleaned.contains(CODEX_OFFICIAL_PROXY_ROUTE_MARKER));
     }
 
     #[test]

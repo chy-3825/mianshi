@@ -263,6 +263,13 @@ export function useProviderActions(
         }
       }
 
+      // Codex switches now start CC Switch's own local route in the backend
+      // when the selected card needs request conversion or token injection.
+      // Keep the warning for the other apps, whose switches still require
+      // the user to enable takeover separately.
+      if (activeApp === "codex") {
+        proxyRequiredReason = null;
+      }
       if (proxyRequiredReason) {
         toast.warning(
           t("notifications.proxyRequiredForSwitch", {
@@ -273,8 +280,8 @@ export function useProviderActions(
         );
       }
 
-      // Codex official account cards can reuse the active native ChatGPT login
-      // through local routing. Other apps' official providers remain blocked.
+      // The Codex switch command releases local takeover before selecting an
+      // unbound native ChatGPT card. Other apps retain the takeover block.
       const officialSupportsTakeover = supportsOfficialProxyTakeover(
         activeApp,
         provider,
@@ -282,7 +289,8 @@ export function useProviderActions(
       if (
         isProxyTakeover &&
         provider.category === "official" &&
-        !officialSupportsTakeover
+        !officialSupportsTakeover &&
+        activeApp !== "codex"
       ) {
         toast.error(
           t("notifications.officialBlockedByProxy", {

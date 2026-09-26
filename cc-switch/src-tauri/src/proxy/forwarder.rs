@@ -68,9 +68,23 @@ fn validate_codex_official_authorization(
         None | Some("") => Err(ProxyError::AuthError(
             "Codex 官方登录不可用，请先在 Codex 中完成 ChatGPT 登录".to_string(),
         )),
-        Some(value) if value.contains(PROXY_AUTH_PLACEHOLDER) => Err(ProxyError::AuthError(
-            "已切换到 OpenAI 官方供应商，请重启 Codex 或新建会话以加载官方登录配置".to_string(),
-        )),
+        Some(value) if value.contains(PROXY_AUTH_PLACEHOLDER) => {
+            let managed = provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+                .is_some();
+            if managed {
+                Ok(())
+            } else {
+                // 代理接管模式下客户端只能发送本地占位符，重启 Codex 不会
+                // 改变这一点：必须先绑定一个 CC Switch 托管的 ChatGPT 账号。
+                Err(ProxyError::AuthError(
+                    "该 OpenAI 官方卡片尚未绑定 CC Switch 中的 ChatGPT 账号，请先在 CC Switch 中登录并绑定账号"
+                        .to_string(),
+                ))
+            }
+        }
         Some(_) => {
             let managed_account_id = provider
                 .meta
@@ -1200,6 +1214,12 @@ impl RequestForwarder {
         let codex_official_auth_passthrough = matches!(app_type, AppType::Codex)
             && super::providers::is_codex_official_provider(provider);
 
+        // 代理接管模式下的官方卡片：Codex 的 config.toml 指向本地代理，只会
+        // 发送 `PROXY_MANAGED` 占位符。真实的 ChatGPT access_token 必须由
+        // 代理解析后注入，否则占位符会被原样发往 chatgpt.com 并必然返回
+        // 401，表现为 Codex 一直重连。
+        let mut codex_official_managed_auth: Option<(String, String)> = None;
+
         if codex_official_auth_passthrough {
             let (expected_chatgpt_account_id, managed_session_matches) = match provider
                 .meta
@@ -1218,7 +1238,9 @@ impl RequestForwarder {
                         .map_err(|error| {
                             ProxyError::AuthError(format!("Codex OAuth 账号解析失败: {error}"))
                         })?;
-                    let session_matches = match codex_bearer_access_token(headers) {
+                    let inbound_access_token = codex_bearer_access_token(headers);
+                    let session_matches = match inbound_access_token {
+                        Some(PROXY_AUTH_PLACEHOLDER) => true,
                         Some(access_token) => {
                             crate::codex_config::codex_live_auth_matches_managed_request(
                                 &local_account_id,
@@ -1230,6 +1252,20 @@ impl RequestForwarder {
                         }
                         None => false,
                     };
+                    // 客户端送来的就是本地占位符：凭据由 CC Switch 托管，
+                    // 这里解析成绑定账号的有效 access_token 再发往上游。
+                    if inbound_access_token == Some(PROXY_AUTH_PLACEHOLDER) {
+                        let token = codex_state
+                            .0
+                            .get_valid_token_for_account(&local_account_id)
+                            .await
+                            .map_err(|error| {
+                                ProxyError::AuthError(format!(
+                                    "OpenAI 官方账号凭据不可用，请在 CC Switch 中重新登录该账号: {error}"
+                                ))
+                            })?;
+                        codex_official_managed_auth = Some((token, chatgpt_account_id.clone()));
+                    }
                     (Some(chatgpt_account_id), Some(session_matches))
                 }
                 None => (None, None),
@@ -1721,8 +1757,11 @@ impl RequestForwarder {
             || codex_responses_to_anthropic
             || request_is_streaming;
 
-        // Codex OAuth 需要注入的 ChatGPT-Account-Id（在动态 token 获取期间填充）
-        let mut codex_oauth_account_id: Option<String> = None;
+        // Codex OAuth 需要注入的 ChatGPT-Account-Id（在动态 token 获取期间填充）。
+        // 官方卡片接管时账号已在上面的占位符解析阶段确定。
+        let mut codex_oauth_account_id: Option<String> = codex_official_managed_auth
+            .as_ref()
+            .map(|(_, chatgpt_account_id)| chatgpt_account_id.clone());
         let mut should_send_codex_oauth_session_headers = false;
 
         // 获取认证头（提前准备，用于内联替换），同时保留仅用于日志脱敏的
@@ -2084,15 +2123,32 @@ impl RequestForwarder {
                 || key_str.eq_ignore_ascii_case("x-api-key")
                 || key_str.eq_ignore_ascii_case("x-goog-api-key")
             {
-                // Codex official account cards deliberately keep credentials
-                // out of provider storage. `requires_openai_auth = true` makes
-                // Codex send the active ChatGPT authorization, which must reach
-                // the official upstream unchanged. Other credential headers
-                // are still discarded.
+                // The managed official card keeps credentials out of provider
+                // storage. Replace its local placeholder with the selected
+                // CC Switch account token; only a verified legacy session may
+                // pass an existing bearer through. Other credential headers
+                // are discarded.
                 if codex_official_auth_passthrough && key_str.eq_ignore_ascii_case("authorization")
                 {
                     saw_auth = true;
-                    ordered_headers.append(key.clone(), value.clone());
+                    let inbound_is_placeholder = value
+                        .to_str()
+                        .map(|value| value.contains(PROXY_AUTH_PLACEHOLDER))
+                        .unwrap_or(false);
+                    match (inbound_is_placeholder, codex_official_managed_auth.as_ref()) {
+                        (true, Some((access_token, _))) => {
+                            let bearer = format!("Bearer {access_token}");
+                            let header = http::HeaderValue::from_str(&bearer).map_err(|error| {
+                                ProxyError::Internal(format!(
+                                    "Failed to build managed authorization header: {error}"
+                                ))
+                            })?;
+                            ordered_headers.append(http::header::AUTHORIZATION, header);
+                        }
+                        _ => {
+                            ordered_headers.append(key.clone(), value.clone());
+                        }
+                    }
                     continue;
                 }
                 if !saw_auth {
@@ -2775,9 +2831,8 @@ impl RequestForwarder {
     }
 
     fn categorize_proxy_error(&self, error: &ProxyError, provider: &Provider) -> ErrorCategory {
-        // Authentication belongs to the Codex client for an official route.
-        // Every retry would reuse the selected account's inbound Authorization
-        // header against another card, so no official-route error may fail over.
+        // Official account routing is pinned to the selected managed account.
+        // Retrying another card could send that account's credentials upstream.
         if super::providers::is_codex_official_provider(provider) {
             return ErrorCategory::NonRetryable;
         }
@@ -4702,7 +4757,7 @@ mod tests {
     }
 
     #[test]
-    fn official_codex_rejects_stale_proxy_placeholder_with_restart_hint() {
+    fn official_codex_rejects_proxy_placeholder_without_managed_binding() {
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::AUTHORIZATION,
@@ -4713,7 +4768,7 @@ mod tests {
         provider.category = Some("official".to_string());
         let error = validate_codex_official_authorization(&headers, &provider, None, None)
             .expect_err("stale placeholder must be rejected");
-        assert!(matches!(error, ProxyError::AuthError(message) if message.contains("重启 Codex")));
+        assert!(matches!(error, ProxyError::AuthError(message) if message.contains("绑定")));
     }
 
     #[test]
