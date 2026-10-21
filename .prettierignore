@@ -1,0 +1,9 @@
+node_modules
+dist
+build
+.electron-cache
+.venv-stt
+artifacts/benchmark-tools
+artifacts/benchmark-100
+package-lock.json
+*.md

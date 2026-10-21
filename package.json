@@ -1,0 +1,120 @@
+{
+  "name": "interview-copilot",
+  "version": "1.1.0",
+  "description": "Real-time interview assistant: dual-channel transcription (Deepgram) + LLM answers (DeepSeek/Gemini/OpenAI/Ollama), grounded in your own documents.",
+  "main": "src/main/main.js",
+  "type": "commonjs",
+  "author": "ericwang915",
+  "license": "MIT",
+  "homepage": "https://github.com/chy-3825/mianshi#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chy-3825/mianshi.git"
+  },
+  "bugs": {
+    "url": "https://github.com/chy-3825/mianshi/issues"
+  },
+  "keywords": [
+    "electron",
+    "interview",
+    "deepgram",
+    "deepseek",
+    "gemini",
+    "openai",
+    "ollama",
+    "speech-to-text",
+    "llm",
+    "transcription"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "cross-env ELECTRON_RUN_AS_NODE= electron .",
+    "dev": "cross-env ELECTRON_RUN_AS_NODE= electron . --enable-logging",
+    "setup:stt": "bash scripts/setup-local-stt.sh",
+    "test": "node --test",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "screenshot": "cross-env ELECTRON_RUN_AS_NODE= INTERVIEW_SCREENSHOT=1 electron .",
+    "gif": "cross-env ELECTRON_RUN_AS_NODE= INTERVIEW_GIF=1 electron .",
+    "icon": "cross-env ELECTRON_RUN_AS_NODE= electron tools/make-icon.js",
+    "social": "cross-env ELECTRON_RUN_AS_NODE= electron tools/make-social.js",
+    "package": "electron-packager . \"Real Time Interview Copilot\" --platform=darwin --arch=x64 --app-bundle-id=com.interview.copilot --icon=build/icon.icns --out=dist --overwrite --extend-info=extend-info.plist --prune=true",
+    "sign": "codesign --force --deep --sign - \"dist/Real Time Interview Copilot-darwin-x64/Real Time Interview Copilot.app\"",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win",
+    "dist:linux": "electron-builder --linux && tar -czf dist/linux-stt-setup.tar.gz scripts/setup-local-stt.sh local_stt/requirements-sensevoice.txt local_stt/requirements-qwen3-asr.txt local_stt/requirements-whisper.txt"
+  },
+  "build": {
+    "appId": "com.interview.copilot",
+    "productName": "Real Time Interview Copilot",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "LICENSE",
+        "to": "LICENSE"
+      },
+      {
+        "from": "local_stt",
+        "to": "local_stt",
+        "filter": [
+          "server.py",
+          "requirements-*.txt"
+        ]
+      },
+      {
+        "from": "scripts/setup-local-stt.sh",
+        "to": "scripts/setup-local-stt.sh"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Real Time Interview Copilot transcribes your microphone (the candidate) in real time.",
+        "NSScreenCaptureUsageDescription": "Real Time Interview Copilot captures system audio (the interviewer) via screen-capture loopback."
+      }
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Utility"
+    }
+  },
+  "devDependencies": {
+    "@electron/packager": "^20.0.0",
+    "cross-env": "^10.1.0",
+    "electron": "^33.2.0",
+    "electron-builder": "^26.15.2",
+    "eslint": "^10.4.1",
+    "prettier": "^3.8.3"
+  },
+  "dependencies": {
+    "mammoth": "^1.8.0",
+    "pdf-parse": "^1.1.1"
+  }
+}

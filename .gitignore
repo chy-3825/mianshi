@@ -1,0 +1,18 @@
+node_modules/
+dist/
+out/
+.electron-cache/
+.venv-stt/
+*.log
+.DS_Store
+
+# Secrets / local config — never commit real keys
+.env
+.env.*
+!.env.example
+settings.json
+settings.local.json
+knowledge.json
+artifacts/
+__pycache__/
+*.pyc
